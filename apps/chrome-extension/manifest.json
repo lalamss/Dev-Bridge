@@ -1,0 +1,28 @@
+{
+  "manifest_version": 3,
+  "name": "DevBridge",
+  "version": "0.1.0",
+  "description": "A bidirectional browser-to-code development workspace (see architecture doc section 8).",
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "permissions": ["scripting", "activeTab", "storage"],
+  "host_permissions": ["http://localhost/*", "http://127.0.0.1/*"],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["http://localhost/*", "http://127.0.0.1/*"],
+      "js": ["content-script.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "devtools_page": "devtools.html",
+  "action": {
+    "default_title": "DevBridge"
+  }
+}

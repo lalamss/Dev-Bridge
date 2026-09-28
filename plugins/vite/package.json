@@ -1,0 +1,14 @@
+{
+  "name": "@devbridge/vite-plugin",
+  "version": "0.1.0",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "peerDependencies": {
+    "vite": "^5.0.0"
+  },
+  "dependencies": {
+    "@devbridge/protocol": "workspace:*",
+    "@devbridge/adapter-react": "workspace:*"
+  },
+  "type": "module"
+}

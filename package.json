@@ -1,0 +1,19 @@
+{
+  "name": "devbridge",
+  "private": true,
+  "version": "0.1.0",
+  "description": "DevBridge — a bidirectional browser-to-code development workspace",
+  "scripts": {
+    "build": "turbo run build",
+    "dev": "turbo run dev --parallel",
+    "typecheck": "turbo run typecheck",
+    "agent": "pnpm --filter @devbridge/local-agent dev",
+    "cli": "pnpm --filter @devbridge/cli start",
+    "example": "pnpm --filter @devbridge/example-react-vite dev"
+  },
+  "devDependencies": {
+    "turbo": "^2.1.0",
+    "typescript": "^5.6.0"
+  },
+  "packageManager": "pnpm@9.7.0"
+}

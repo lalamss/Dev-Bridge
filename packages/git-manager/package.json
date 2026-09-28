@@ -1,0 +1,11 @@
+{
+  "name": "@devbridge/git-manager",
+  "version": "0.1.0",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "dependencies": {
+    "@devbridge/protocol": "workspace:*",
+    "simple-git": "^3.27.0"
+  },
+  "type": "module"
+}

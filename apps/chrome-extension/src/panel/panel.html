@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DevBridge</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body, #root { height: 100%; background: #0f172a; }
+  </style>
+  <!-- Monaco AMD loader — vendored locally by copy-assets.cjs.
+       A remote CDN loader is blocked here: Chrome applies the extension's
+       CSP to DevTools panel pages, and MV3 ships script-src 'self'. -->
+  <script src="./vs/loader.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <!-- After build, panel.js sits alongside panel.html in dist/ -->
+  <script type="module" src="./panel.js"></script>
+</body>
+</html>

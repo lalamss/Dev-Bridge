@@ -1,0 +1,20 @@
+{
+  "name": "@devbridge/cli",
+  "version": "0.1.0",
+  "private": true,
+  "bin": {
+    "devbridge": "./src/index.ts"
+  },
+  "scripts": {
+    "start": "tsx src/index.ts",
+    "build": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "commander": "^12.1.0",
+    "node-fetch": "^3.3.2"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}
