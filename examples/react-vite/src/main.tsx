@@ -1,11 +1,12 @@
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { App } from "./App";
+import "./styles.css";
 
 /**
  * Plain React entry point for the example app.
- * The runtime bridge is initialised inside CheckoutButton directly
- * so we don't need any workspace package imports here.
+ * DevBridge instrumentation is injected automatically by
+ * devbridgePlugin() in vite.config.ts — no manual attributes here.
  */
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
