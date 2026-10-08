@@ -3,15 +3,16 @@
  * (architecture doc section 8: "DevTools Page").
  *
  * This document runs in its own window, separate from the panel's document,
- * so the port it opens is NOT reachable from panel.html — that is fine. The
- * background worker keys ports by tab id, and the panel opens a port with the
- * same name when its React app boots. This page's port exists so the relay is
- * already live (content-script selections are buffered through to whoever is
- * listening) before the user opens the DevBridge tab, and it transparently
- * takes over again if the panel is closed.
+ * so the port it opens is NOT reachable from panel.html — that is fine. It
+ * connects under the `devtools` role (see portRouting.ts) while the panel
+ * connects under the `panel` role; the background worker keeps one slot per
+ * role, so the two documents never evict each other (audit C1). Selections
+ * go to the panel when it is open; this port only receives them while the
+ * panel is closed, in which case they are also buffered by the worker and
+ * replayed to the panel when it connects.
  */
 
-const PANEL_PORT_PREFIX = "devbridge-panel-";
+import { DEVTOOLS_PORT_PREFIX } from "./portRouting";
 
 const tabId = chrome.devtools.inspectedWindow.tabId;
 
@@ -22,7 +23,21 @@ let port: chrome.runtime.Port | null = null;
 let retryTimer: ReturnType<typeof setTimeout> | undefined;
 
 function connect(): void {
-  port = chrome.runtime.connect({ name: `${PANEL_PORT_PREFIX}${tabId}` });
+  port = chrome.runtime.connect({ name: `${DEVTOOLS_PORT_PREFIX}${tabId}` });
+
+  // The worker only routes selections here while the panel is closed. There
+  // is no UI in this document to show them — but the listener must exist:
+  // without it a selection delivered to this port vanishes silently (audit
+  // C1), and its presence documents that this port is a live relay fallback,
+  // not a dead end.
+  port.onMessage.addListener((message) => {
+    if (message?.type === "devbridge:element-selected") {
+      console.debug(
+        "[DevBridge] element selected while the panel is closed; buffered for panel open:",
+        message.devId,
+      );
+    }
+  });
 
   port.onDisconnect.addListener(() => {
     port = null;
@@ -44,9 +59,5 @@ chrome.devtools.network.onNavigated.addListener(() => {
 
 chrome.devtools.panels.create("DevBridge", "icons/icon48.png", "panel.html", () => {
   // Panel created. panel.html boots src/panel/index.tsx, which opens its own
-  // port with the same name to receive element-selected events.
+  // port (role `panel`) to receive element-selected events.
 });
-
-// Marks this as a module so its top-level consts stay out of the global
-// scope shared with background.ts. See the note in background.ts.
-export {};

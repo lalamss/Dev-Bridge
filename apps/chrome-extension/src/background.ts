@@ -14,23 +14,31 @@
  *   Panel  ──postMessage──▶  background  ──tabs.sendMessage──▶  content script
  *   Panel  ◀──postMessage──  background  ◀──onMessage────────  content script
  *
- * The devtools page opens the port as soon as DevTools is open, so the relay
- * is already live before the user even opens the DevBridge tab. The panel
- * opens its own port with the SAME name; the background keeps the most recent
- * one in its `panels` map, so opening/closing the panel UI never tears down
- * the relay (the devtools page reconnects if the panel's port goes away).
- *
- * The port name carries the tab id — `devbridge-panel-{tabId}` — so a single
- * background worker can serve many inspected tabs at once.
+ * ── Why two port names (audit C1) ──────────────────────────────────────────
+ * The DevTools page (`devtools.ts`) and the panel (`panel/App.tsx`) used to
+ * connect under the SAME name into a single slot, and this worker
+ * disconnected whichever port was already there. Both documents reconnect
+ * 500 ms after a disconnect — a mutual-eviction loop at ~2 Hz for as long as
+ * DevTools stayed open, dropping roughly half of all element selections into
+ * a document with no listener. They now connect under different names (see
+ * portRouting.ts) into separate slots, so a reconnect only ever supersedes a
+ * port of the same role and the loop is structurally impossible.
  *
  * No filesystem or shell access ever happens here; that boundary lives
  * entirely in the local agent (architecture doc section 52).
  */
 
-/** Port name prefix; the suffix is always the inspected tab id. */
-const PANEL_PORT_PREFIX = "devbridge-panel-";
-/** tabId → the live DevTools port for that tab. */
-const panels = new Map<number, chrome.runtime.Port>();
+import { PortDirectory } from "./portRouting";
+
+// Chrome clamps alarms to at most once every 30 seconds; a shorter period is
+// silently dropped with a warning, so 0.5 is the fastest interval that exists.
+chrome.alarms.create("devbridge-keepalive", { periodInMinutes: 0.5 });
+chrome.alarms.onAlarm.addListener(() => {
+  // no-op — wakes the worker so it can re-adopt live ports.
+});
+
+/** tabId + role → the live DevTools port. See portRouting.ts for the relay. */
+const directory = new PortDirectory();
 
 /** Commands the panel is allowed to push down to a content script. */
 const PANEL_TO_CONTENT = new Set([
@@ -40,41 +48,60 @@ const PANEL_TO_CONTENT = new Set([
   "devbridge:revert-preview",
 ]);
 
-function parseTabId(portName: string): number | null {
-  if (!portName.startsWith(PANEL_PORT_PREFIX)) return null;
-  const tabId = Number(portName.slice(PANEL_PORT_PREFIX.length));
-  return Number.isInteger(tabId) && tabId >= 0 ? tabId : null;
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
-// Panel → background → content script
+// Panel / devtools page → background → content script
 // ─────────────────────────────────────────────────────────────────────────────
 
 chrome.runtime.onConnect.addListener((port) => {
-  const tabId = parseTabId(port.name);
-  if (tabId === null) return; // not one of ours
+  const { previousSameRole, parsed } = directory.connect(port);
+  if (!parsed) return; // not one of ours
 
-  // A newer port for this tab (e.g. the panel UI opening) supersedes the
-  // devtools page's fallback port, so drop the stale one.
-  const previous = panels.get(tabId);
-  if (previous && previous !== port) {
+  // A same-role reconnect (e.g. the panel reloading) supersedes its
+  // predecessor. A port of the OTHER role is never touched (audit C1).
+  if (previousSameRole) {
     try {
-      previous.disconnect();
+      previousSameRole.disconnect();
     } catch {
       /* already gone */
     }
   }
-  panels.set(tabId, port);
+
+  // A selection made while the panel was closed is still waiting — deliver it
+  // now that someone is listening.
+  if (parsed.role === "panel") {
+    const pending = directory.takePendingSelection(parsed.tabId);
+    if (pending) {
+      try {
+        port.postMessage(pending);
+      } catch {
+        directory.rememberSelection(parsed.tabId, pending);
+      }
+    }
+  }
 
   port.onDisconnect.addListener(() => {
-    // Guard against clobbering a newer port that already took this slot.
-    if (panels.get(tabId) === port) panels.delete(tabId);
+    directory.onDisconnect(port);
+    // The panel is the only document that starts inspection. When its port
+    // goes away (panel closed, DevTools closed, reload) the content script
+    // would otherwise keep swallowing every click with nobody listening
+    // (audit C3) — so inspection stops with the panel, best-effort.
+    if (parsed.role === "panel") {
+      void forwardToContentScript(parsed.tabId, {
+        type: "devbridge:set-inspecting",
+        value: false,
+      });
+    }
   });
 
   port.onMessage.addListener((message) => {
     if (!message || !PANEL_TO_CONTENT.has(message.type)) return;
-    void forwardToContentScript(tabId, message);
+    void forwardToContentScript(parsed.tabId, message);
   });
+});
+
+// A closed tab keeps no relay state behind (audit X1).
+chrome.tabs.onRemoved.addListener((tabId) => {
+  directory.onTabRemoved(tabId);
 });
 
 async function forwardToContentScript(tabId: number, message: { type: string } & Record<string, unknown>): Promise<void> {
@@ -82,40 +109,56 @@ async function forwardToContentScript(tabId: number, message: { type: string } &
     await chrome.tabs.sendMessage(tabId, message);
   } catch {
     // No content script on this tab (wrong origin, page not yet idle, or the
-    // service worker was restarted). Tell the panel so it can say something
-    // useful instead of appearing to hang.
-    panels.get(tabId)?.postMessage({
-      type: "devbridge:no-content-script",
-      command: message.type,
-    });
+    // service worker was restarted). Tell whoever is listening so the panel
+    // can say something useful instead of appearing to hang.
+    const target = directory.panelFor(tabId) ?? directory.devtoolsFor(tabId);
+    try {
+      target?.postMessage({
+        type: "devbridge:no-content-script",
+        command: message.type,
+      });
+    } catch {
+      // Port died between the lookup and the post — best effort.
+    }
   }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Content script → background → panel
+// Content script → background → panel (preferred) or devtools page (fallback)
 // ─────────────────────────────────────────────────────────────────────────────
 
 chrome.runtime.onMessage.addListener((message, sender) => {
-  if (message?.type !== "devbridge:element-selected") return false;
+  if (message?.type !== "devbridge:element-selected" && message?.type !== "devbridge:inspecting-changed") {
+    return false;
+  }
 
   const tabId = sender.tab?.id;
   if (typeof tabId !== "number") return false;
 
-  try {
-    panels.get(tabId)?.postMessage({
+  const relay = {
+    ...message,
+    tabId,
+  };
+
+  if (message.type === "devbridge:element-selected") {
+    directory.rememberSelection(tabId, {
       type: "devbridge:element-selected",
-      devId: message.devId,
+      devId: message.devId ?? null,
       tabId,
     });
+  }
+
+  try {
+    directory.targetForSelection(tabId)?.postMessage(relay);
   } catch {
-    // Port died between the map lookup and the post — best effort.
+    // Port died between the lookup and the post — the selection stays in the
+    // pending buffer and is delivered on the next panel connect.
   }
 
   // Nothing is returned to the content script; it does not await a response.
   return false;
 });
 
-// This file is a Rollup entry with no imports of its own, so without an
-// explicit marker TypeScript treats it as a global script and merges its
-// scope with devtools.ts (both declare PANEL_PORT_PREFIX).
+// This file imports portRouting, so it is a module and its scope never merges
+// with devtools.ts (which declares its own copy of the prefixes).
 export {};

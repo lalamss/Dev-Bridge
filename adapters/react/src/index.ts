@@ -1,3 +1,3 @@
-export * from "./ReactAdapter";
-export * from "./babelPlugin";
-export * from "./runtimeHook";
+export * from "./ReactAdapter.js";
+export * from "./babelPlugin.js";
+export * from "./runtimeHook.js";

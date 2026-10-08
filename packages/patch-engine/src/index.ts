@@ -1,2 +1,2 @@
-export * from "./PatchEngine";
-export * from "./risk";
+export * from "./PatchEngine.js";
+export * from "./risk.js";

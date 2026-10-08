@@ -1,1 +1,1 @@
-export * from "./FrameworkAdapter";
+export * from "./FrameworkAdapter.js";

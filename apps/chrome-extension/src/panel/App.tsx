@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { identityMissingMessage, sourceFailureMessage } from "./sourceMessage";
 
 // ─────────────────────────────────────────────────────────────
 // Types (mirrors @devbridge/protocol — inlined so the extension
@@ -81,6 +82,7 @@ type View = "editor" | "diff" | "applied";
 export function App() {
   // Selection
   const [devId, setDevId]       = useState<string | null>(null);
+  const [selectedTag, setSelectedTag] = useState<string | null>(null);
   const [identity, setIdentity] = useState<DevIdentity | null>(null);
   const [source, setSource]     = useState<string>("");          // original file content
   const [snapshot, setSnapshot] = useState<StateSnapshot | null>(null);
@@ -99,6 +101,7 @@ export function App() {
   const modelRef   = useRef<any>(null);
   const diffContainerRef = useRef<HTMLDivElement>(null);
   const diffEditorRef    = useRef<any>(null);
+  const diffModelsRef    = useRef<any[]>([]);
 
   // WS
   const wsRef = useRef<WebSocket | null>(null);
@@ -106,24 +109,68 @@ export function App() {
   // Panel ⇄ background port (DevTools panels can't use sendMessage)
   const { port, connected, send } = usePanelPort();
 
-  // ── flash helper ──
+  // ── flash helper (audit X5: overlapping flashes raced — a stale timer
+  // cleared a newer message early, and timers leaked on unmount) ──
+  const flashTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  useEffect(() => () => {
+    if (flashTimer.current) clearTimeout(flashTimer.current);
+  }, []);
   function flash(text: string, kind: "ok" | "err" | "warn" = "ok") {
     setFlashMsg({ text, kind });
-    setTimeout(() => setFlashMsg(null), 3000);
+    if (flashTimer.current) clearTimeout(flashTimer.current);
+    flashTimer.current = setTimeout(() => setFlashMsg(null), 3000);
   }
+
+  // The content script owns the real inspection state (it auto-stops on
+  // click and cancels on Escape); the panel mirrors it instead of guessing
+  // from its own button (audit C3). `inspectingRef` lets the reconnect
+  // resync below push the latest intent without re-firing on every toggle.
+  const [inspecting, setInspecting] = useState(false);
+  const inspectingRef = useRef(inspecting);
+  inspectingRef.current = inspecting;
+
+  // Resync after a worker restart or reconnect: push the panel's intent so a
+  // content script orphaned by a suspended worker heals instead of staying
+  // stuck (or silently stopped) with nobody telling the user.
+  const resyncedPorts = useRef(new Set<chrome.runtime.Port>());
+  useEffect(() => {
+    if (!port || !connected || resyncedPorts.current.has(port)) return;
+    resyncedPorts.current.add(port);
+    send({ type: "devbridge:set-inspecting", value: inspectingRef.current });
+  }, [port, connected, send]);
 
   // ── element selected (pushed down the port by the background worker) ──
   useEffect(() => {
     if (!port) return;
     const listener = (msg: any) => {
-      if (msg?.type === "devbridge:element-selected" && msg.devId) {
-        setDevId(msg.devId);
+      if (msg?.type === "devbridge:element-selected") {
+        // Audit C5: a new selection resets EVERYTHING from the previous one.
+        // The old code kept `identity`/`source`, so a missing identity showed
+        // the previous element's file and line under the new devId.
+        setDevId(msg.devId ?? null);
+        setSelectedTag(typeof msg.tag === "string" ? msg.tag : null);
+        setIdentity(null);
+        setSource("");
         setView("editor");
         setPatch(null);
         setCheckpoint(null);
         setSnapshot(null);
+        if (!msg.devId) {
+          // Audit C4: only a DOM node was identified — explain instead of
+          // fabricating a source location.
+          flash(
+            msg.tag
+              ? `Selected <${msg.tag}> carries no DevBridge identity (no data-dev-id). Source mapping is unavailable for this element — it may be rendered by a path the build plugin did not instrument.`
+              : `Selected element carries no DevBridge identity. Source mapping is unavailable.`,
+            "warn",
+          );
+        }
+      }
+      if (msg?.type === "devbridge:inspecting-changed") {
+        setInspecting(Boolean(msg.value));
       }
       if (msg?.type === "devbridge:no-content-script") {
+        setInspecting(false);
         flash(
           `No DevBridge content script on this page (${msg.command}). Reload the tab and open it on http://localhost or http://127.0.0.1.`,
           "err",
@@ -142,7 +189,7 @@ export function App() {
       try {
         const idRes = await fetch(`${AGENT}/identity/${devId}`);
         if (idRes.status === 404) {
-          flash(`No identity registered for ${devId} — the page hasn't sent its component map to the local agent yet.`, "warn");
+          flash(identityMissingMessage(devId), "warn");
           return;
         }
         if (!idRes.ok) throw new Error(`GET /identity -> ${idRes.status}`);
@@ -151,7 +198,13 @@ export function App() {
         setIdentity(id);
 
         const srcRes = await fetch(`${AGENT}/source?file=${encodeURIComponent(id.source.file)}`);
-        if (!srcRes.ok) throw new Error(`GET /source -> ${srcRes.status}`);
+        // Batch 6: identity-hit + source-miss is the stale/wrong-root agent
+        // signature (reproduced live) — diagnose it precisely instead of
+        // claiming the agent is unreachable.
+        if (!srcRes.ok) {
+          flash(sourceFailureMessage(devId, id.source.file, srcRes.status), "warn");
+          return;
+        }
         const d = await srcRes.json();
         if (!cancelled) setSource(d.content ?? "");
       } catch {
@@ -170,24 +223,67 @@ export function App() {
       .catch(() => {});
   }, [devId]);
 
-  // ── live WS for state.changed ──
+  // ── live WS for state.changed (audit X4: the old socket never
+  // reconnected and never surfaced errors — after an agent restart, live
+  // props/state silently stopped until devId changed) ──
+  const [liveStatus, setLiveStatus] = useState<"connecting" | "live" | "offline">("connecting");
   useEffect(() => {
-    const ws = new WebSocket(AGENT_WS);
-    wsRef.current = ws;
-    ws.onmessage = (e) => {
+    let disposed = false;
+    let retry: ReturnType<typeof setTimeout> | undefined;
+    let attempt = 0;
+
+    const open = () => {
+      if (disposed) return;
+      setLiveStatus(attempt === 0 ? "connecting" : "offline");
+      let ws: WebSocket;
       try {
-        const ev = JSON.parse(e.data) as { type: string; payload: any };
-        if (ev.type === "state.changed" && ev.payload.devId === devId) {
-          setSnapshot({ devId: ev.payload.devId, props: ev.payload.props ?? {}, state: ev.payload.state ?? {}, context: ev.payload.context ?? {}, timestamp: ev.payload.timestamp ?? new Date().toISOString() });
-          setLiveTag(true);
-          setTimeout(() => setLiveTag(false), 800);
-        }
-        if (ev.type === "patch.applied") {
-          flash("Patch applied and saved to disk ✅", "ok");
-        }
-      } catch {}
+        ws = new WebSocket(AGENT_WS);
+      } catch {
+        scheduleRetry();
+        return;
+      }
+      wsRef.current = ws;
+      ws.onopen = () => {
+        attempt = 0;
+        if (!disposed) setLiveStatus("live");
+      };
+      ws.onmessage = (e) => {
+        try {
+          const ev = JSON.parse(e.data) as { type: string; payload: any };
+          if (ev.type === "state.changed" && ev.payload.devId === devId) {
+            setSnapshot({ devId: ev.payload.devId, props: ev.payload.props ?? {}, state: ev.payload.state ?? {}, context: ev.payload.context ?? {}, timestamp: ev.payload.timestamp ?? new Date().toISOString() });
+            setLiveTag(true);
+            setTimeout(() => setLiveTag(false), 800);
+          }
+          if (ev.type === "patch.applied") {
+            flash("Patch applied and saved to disk ✅", "ok");
+          }
+        } catch {}
+      };
+      ws.onerror = () => {
+        // onerror fires before onclose — onclose owns the retry.
+      };
+      ws.onclose = () => {
+        if (wsRef.current === ws) wsRef.current = null;
+        scheduleRetry();
+      };
     };
-    return () => ws.close();
+
+    const scheduleRetry = () => {
+      if (disposed) return;
+      setLiveStatus("offline");
+      attempt += 1;
+      const delay = Math.min(2000 * attempt, 10000);
+      retry = setTimeout(open, delay);
+    };
+
+    open();
+    return () => {
+      disposed = true;
+      if (retry) clearTimeout(retry);
+      wsRef.current?.close();
+      wsRef.current = null;
+    };
   }, [devId]);
 
   // ── Monaco: mount editor when source arrives ──
@@ -219,11 +315,30 @@ export function App() {
       modelRef.current.setValue(source);
     }
 
-    // Reveal the target line
+    // Reveal the target line and column (audit P10). Babel columns are
+    // 0-based; Monaco positions are 1-based.
     const line = identity?.source.start.line ?? 1;
+    const column = (identity?.source.start.column ?? 0) + 1;
     editorRef.current.revealLineInCenter(line);
-    editorRef.current.setPosition({ lineNumber: line, column: 1 });
+    editorRef.current.setPosition({ lineNumber: line, column });
   }, [source, view]);
+
+  // ── Monaco: dispose everything on unmount (audit P6 — leaked models) ──
+  useEffect(() => () => {
+    try {
+      diffEditorRef.current?.dispose();
+      for (const model of diffModelsRef.current) model.dispose();
+      editorRef.current?.dispose();
+      modelRef.current?.dispose();
+    } catch {
+      /* teardown must never throw */
+    } finally {
+      diffEditorRef.current = null;
+      diffModelsRef.current = [];
+      editorRef.current = null;
+      modelRef.current = null;
+    }
+  }, []);
 
   // ── Monaco: mount diff editor when we enter diff view ──
   useEffect(() => {
@@ -231,11 +346,18 @@ export function App() {
     const monaco = window.monaco;
     if (!monaco) return;
 
-    // Dispose previous diff editor
+    // Dispose the previous diff editor AND its models (audit P6).
+    // `editor.dispose()` alone keeps the models alive — each selection used
+    // to leak two.
     if (diffEditorRef.current) { diffEditorRef.current.dispose(); diffEditorRef.current = null; }
+    for (const model of diffModelsRef.current) {
+      try { model.dispose(); } catch { /* already disposed */ }
+    }
+    diffModelsRef.current = [];
 
     const originalModel = monaco.editor.createModel(source, inferLanguage(patch.file));
     const modifiedModel = monaco.editor.createModel(editorRef.current?.getValue() ?? source, inferLanguage(patch.file));
+    diffModelsRef.current = [originalModel, modifiedModel];
 
     diffEditorRef.current = monaco.editor.createDiffEditor(diffContainerRef.current, {
       theme: "vs-dark",
@@ -251,23 +373,62 @@ export function App() {
     diffEditorRef.current.setModel({ original: originalModel, modified: modifiedModel });
   }, [view, patch]);
 
+  // ── Agent error mapping (Batch 3 §5). Every failure gets a distinct,
+  // actionable message; success is shown only after the agent confirms the
+  // write. `readAgentError` never surfaces absolute paths — the agent
+  // sanitizes them server-side, and anything unparseable degrades to the
+  // status-specific fallback below rather than raw HTML/text.
+  async function readAgentError(res: Response, fallback: string): Promise<string> {
+    try {
+      const body = await res.json();
+      if (body && typeof body.error === "string" && body.error.length > 0) return body.error;
+    } catch {
+      /* non-JSON error body — use the fallback */
+    }
+    return fallback;
+  }
+
+  function networkError(e: unknown): Error {
+    if (e instanceof TypeError) {
+      return new Error("Local agent unavailable — is `devbridge start` running on http://localhost:4577?");
+    }
+    return e as Error;
+  }
+
   // ── Create patch ──
   async function handleCreatePatch() {
-    if (!identity || !editorRef.current) return;
+    // Audit P1: the old code silently returned here while the button stayed
+    // enabled (source non-empty but the editor never mounted) — the click
+    // did nothing with no explanation.
+    if (!identity) {
+      flash("No source identity for this element — select an instrumented element first.", "warn");
+      return;
+    }
+    if (!editorRef.current) {
+      flash("Editor unavailable — Monaco did not load. Reload the DevBridge tab and try again.", "err");
+      return;
+    }
     setBusy(true);
     try {
       const newContent = editorRef.current.getValue();
-      const res = await fetch(`${AGENT}/patch`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          file: identity.source.file,
-          newContent,
-          origin: "manual",
-          devId,
-        }),
-      });
-      if (!res.ok) throw new Error(await res.text());
+      let res: Response;
+      try {
+        res = await fetch(`${AGENT}/patch`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            file: identity.source.file,
+            newContent,
+            origin: "manual",
+            devId,
+          }),
+        });
+      } catch (e) {
+        throw networkError(e);
+      }
+      if (res.status === 403) throw new Error(await readAgentError(res, "Refused: this file is outside the authorized project root."));
+      if (res.status === 400) throw new Error(await readAgentError(res, "Invalid patch request — the file or content was rejected by the agent."));
+      if (!res.ok) throw new Error(await readAgentError(res, `Patch proposal failed (agent said ${res.status}).`));
       const p: SourcePatch = await res.json();
       setPatch(p);
 
@@ -290,12 +451,49 @@ export function App() {
     if (!patch) return;
     setBusy(true);
     try {
-      await fetch(`${AGENT}/patch/${patch.id}/approve`, { method: "POST" });
-      const res = await fetch(`${AGENT}/patch/${patch.id}/apply`, { method: "POST" });
-      if (res.status === 409) throw new Error("Conflict — file changed on disk since patch was created. Re-select the element to reload.");
-      if (!res.ok) throw new Error(await res.text());
+      let approveRes: Response;
+      try {
+        approveRes = await fetch(`${AGENT}/patch/${patch.id}/approve`, { method: "POST" });
+      } catch (e) {
+        throw networkError(e);
+      }
+      // Audit P2: the old code neither awaited nor checked this — an approve
+      // failure was invisible and /apply proceeded anyway. Stop here instead.
+      if (approveRes.status === 404) throw new Error("Patch no longer exists on the agent (did it restart?). Re-select the element to propose again.");
+      if (!approveRes.ok) throw new Error(await readAgentError(approveRes, `Approve failed (agent said ${approveRes.status}). Nothing was written.`));
+
+      let res: Response;
+      try {
+        res = await fetch(`${AGENT}/patch/${patch.id}/apply`, { method: "POST" });
+      } catch (e) {
+        throw networkError(e);
+      }
+      if (res.status === 409) {
+        let reason = "";
+        try {
+          const body = await res.json();
+          reason = body?.reason === "deleted"
+            ? "The source file was deleted after the preview — nothing was written. "
+            : "The source file changed on disk since the preview — nothing was written. ";
+        } catch {
+          /* fall through with the generic conflict text */
+        }
+        throw new Error(`${reason}Re-select the element to reload and propose again.`);
+      }
+      if (res.status === 404) throw new Error("Patch no longer exists on the agent (did it restart?). Re-select the element to propose again.");
+      if (res.status === 403) throw new Error(await readAgentError(res, "Refused: this file is outside the authorized project root. Nothing was written."));
+      if (res.status === 500) throw new Error(await readAgentError(res, "The agent could not write the file (disk or permissions). Nothing was written."));
+      if (!res.ok) throw new Error(await readAgentError(res, `Apply failed (agent said ${res.status}). Nothing was written.`));
       const applied: SourcePatch = await res.json();
+      // Success is shown only on confirmation: the agent must report back an
+      // applied patch, not just a 200.
+      if (applied.status !== "applied") throw new Error("Agent returned without confirming the write — treating as failed. Nothing is assumed about the file.");
       setPatch(applied);
+
+      // Audit P7: the CSS live-preview tag mirrored the proposal; now that
+      // disk holds the applied content the tag would only go stale on the
+      // next edit cycle, so remove it here (reject path already does).
+      revertVisualPreview();
 
       // Git checkpoint
       const cpRes = await fetch(`${AGENT}/git/checkpoint`, {
@@ -356,6 +554,10 @@ export function App() {
 
   function toggleInspect(v: boolean) {
     send({ type: "devbridge:set-inspecting", value: v });
+    // The content script owns the real state and echoes
+    // `devbridge:inspecting-changed`; this is only an optimistic hint so the
+    // button responds instantly even before the echo arrives.
+    setInspecting(v);
   }
 
   function locateElement(id: string) {
@@ -366,19 +568,28 @@ export function App() {
   // RENDER
   // ─────────────────────────────────────────────────────────────
 
-  if (!devId) {
+  // A selection exists even when the element carries no identity (devId
+  // null + tag): the panel must show its "no mapping" explanation, not the
+  // empty state — otherwise the warning flash has nowhere to render.
+  const hasSelection = devId !== null || selectedTag !== null;
+
+  if (!hasSelection) {
     return (
       <div style={S.empty}>
         <div style={{ fontSize: 36 }}>🔍</div>
         <button
           style={{ ...S.primaryBtn, opacity: connected ? 1 : 0.5 }}
-          onClick={() => toggleInspect(true)}
+          onClick={() => toggleInspect(!inspecting)}
           disabled={!connected}
+          aria-label={inspecting ? "Stop inspecting" : "Start inspecting"}
+          title={inspecting ? "Stop inspecting (or press Escape on the page)" : "Hover an element on the page and click it"}
         >
-          Start inspecting
+          {inspecting ? "Stop inspecting" : "Start inspecting"}
         </button>
         <p style={{ color: C.muted, fontSize: 12, textAlign: "center" }}>
-          Hover an element on the page and click it to open it in DevBridge.
+          {inspecting
+            ? "Click any highlighted element on the page — or press Escape to cancel."
+            : "Hover an element on the page and click it to open it in DevBridge."}
         </p>
         {!connected && (
           <p style={{ color: "#fca5a5", fontSize: 11, textAlign: "center", maxWidth: 320 }}>
@@ -396,20 +607,37 @@ export function App() {
       <div style={S.topBar}>
         <div style={S.componentName}>
           <span style={{ color: C.purple }}>⬡</span>{" "}
-          {identity?.component ?? devId}
+          {identity?.component ?? (devId ?? (selectedTag ? `<${selectedTag}> (no identity)` : "unknown"))}
         </div>
-        <div style={S.filePill} title={identity?.source.file}>
-          {identity?.source.file}:{identity?.source.start.line}
+        <div style={S.filePill} title={identity?.source.file ?? "No source mapping for this element"}>
+          {identity ? `${identity.source.file}:${identity.source.start.line}` : "no source"}
         </div>
         {liveTag && <span style={S.liveBadge}>LIVE</span>}
         <button
+          style={{ ...S.ghostBtn, borderColor: inspecting ? C.purple : C.border }}
+          onClick={() => toggleInspect(!inspecting)}
+          title={inspecting ? "Stop inspecting (or press Escape on the page)" : "Inspect another element"}
+          aria-label={inspecting ? "Stop inspecting" : "Inspect another element"}
+        >
+          {inspecting ? "■" : "🔍"}
+        </button>
+        <button
           style={S.ghostBtn}
-          onClick={() => locateElement(devId)}
-          title="Scroll to and flash this element in the page"
+          onClick={() => devId && locateElement(devId)}
+          title={devId ? "Scroll to and flash this element in the page" : "No element to locate"}
+          aria-label="Locate element in page"
+          disabled={!devId}
         >
           🎯
         </button>
-        <button style={S.ghostBtn} onClick={() => { setDevId(null); toggleInspect(false); }}>✕</button>
+        <button
+          style={S.ghostBtn}
+          onClick={() => { setDevId(null); setSelectedTag(null); toggleInspect(false); }}
+          title="Clear selection"
+          aria-label="Clear selection"
+        >
+          ✕
+        </button>
       </div>
 
       {/* ── Flash message ── */}
@@ -436,7 +664,15 @@ export function App() {
       {/* ══════════════ EDITOR VIEW ══════════════ */}
       {view === "editor" && (
         <div style={S.editorWrapper}>
-          {window.monaco ? (
+          {!devId ? (
+            <div style={S.monacoPlaceholder}>
+              No DevBridge identity for this element.<br />
+              <span style={{ fontSize: 11, color: C.muted }}>
+                {selectedTag ? `<${selectedTag}> carries no data-dev-id, so there is no component or source file to show. ` : ""}
+                Select an instrumented element, or press 🔍 to inspect again.
+              </span>
+            </div>
+          ) : window.monaco ? (
             <div ref={monacoContainerRef} style={S.monacoContainer} />
           ) : (
             <div style={S.monacoPlaceholder}>
@@ -533,6 +769,11 @@ export function App() {
         <div style={S.sectionHeader}>
           PROPS & STATE
           {liveTag && <span style={S.liveBadge}>LIVE</span>}
+          {liveStatus === "offline" && (
+            <span style={{ ...S.liveBadge, background: "#713f12" }} title="Local agent unreachable — retrying">
+              OFFLINE
+            </span>
+          )}
         </div>
         {snapshot ? (
           <>

@@ -1,5 +1,29 @@
-import { resolve, sep } from "node:path";
+import { existsSync, realpathSync } from "node:fs";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import type { AIPermissions } from "@devbridge/protocol";
+
+/**
+ * Resolve symlinks in `absPath`, tolerating a path that does not exist yet —
+ * a patch may legitimately create a new file, so the nearest existing ancestor
+ * is canonicalized and the remaining segments are appended unchanged. If
+ * nothing along the way exists (which cannot happen for a path already
+ * constrained to an existing root), the input is returned as-is.
+ */
+function canonicalize(absPath: string): string {
+  const missing: string[] = [];
+  let current = absPath;
+  for (;;) {
+    if (existsSync(current)) {
+      let real = realpathSync(current);
+      for (const segment of missing) real = join(real, segment);
+      return real;
+    }
+    const parent = dirname(current);
+    if (parent === current) return absPath;
+    missing.unshift(basename(current));
+    current = parent;
+  }
+}
 
 /**
  * SecurityManager — architecture doc section 52-54:
@@ -41,18 +65,42 @@ const DEFAULT_AI_PERMISSIONS: AIPermissions = {
 export class SecurityManager {
   private aiPermissions: AIPermissions = { ...DEFAULT_AI_PERMISSIONS };
 
+  /** Canonical (symlink-resolved) project root, used for containment checks. */
+  private readonly canonicalRoot: string;
+
   constructor(private projectRoot: string) {
     this.projectRoot = resolve(projectRoot);
+    this.canonicalRoot = canonicalize(this.projectRoot);
   }
 
-  /** Resolve `relativeOrAbs` and throw unless it is inside the project root. */
+  /**
+   * Resolve `relativeOrAbs` and throw unless it is inside the project root.
+   *
+   * Two checks, both required (docs/audit/2026-10-05-audit.md, S5):
+   *
+   *   1. Lexical — `resolve()` + containment, which rejects `../../etc/passwd`
+   *      and absolute paths outside the root.
+   *   2. Canonical — the path with symlinks resolved via `realpath`, compared
+   *      against the symlink-resolved root. A purely lexical check is defeated
+   *      by any symlink or junction inside the project pointing elsewhere, and
+   *      those are routine in pnpm/npm monorepos.
+   *
+   * The returned path is the canonical one, so callers read and write through
+   * the same fully-resolved location that was just validated.
+   */
   assertPathInProject(relativeOrAbs: string): string {
     const abs = resolve(this.projectRoot, relativeOrAbs);
-    const withSep = this.projectRoot.endsWith(sep) ? this.projectRoot : this.projectRoot + sep;
-    if (abs !== this.projectRoot && !abs.startsWith(withSep)) {
-      throw new PathEscapeError(relativeOrAbs);
-    }
-    return abs;
+    this.assertContained(abs, relativeOrAbs);
+
+    const canonical = canonicalize(abs);
+    this.assertContained(canonical, relativeOrAbs);
+    return canonical;
+  }
+
+  private assertContained(candidate: string, attempted: string): void {
+    const rel = relative(this.canonicalRoot, candidate);
+    const escapes = rel.startsWith("..") || isAbsolute(rel);
+    if (escapes) throw new PathEscapeError(attempted);
   }
 
   setAIPermissions(permissions: Partial<AIPermissions>): AIPermissions {

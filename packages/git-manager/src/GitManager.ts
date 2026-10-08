@@ -35,7 +35,13 @@ export class GitManager {
 
   /** Create a DevBridge checkpoint commit after a patch is applied + tests run. */
   async checkpoint(message: string, testsPassing: boolean | null): Promise<GitCheckpoint> {
-    await this.git.add(["-A"]);
+    // Scope the staging to THIS project root (audit P5/S7). `git add -A`
+    // from a project nested inside a larger repo stages the entire
+    // repository — one "Approve & Apply" in examples/react-vite would commit
+    // every unrelated uncommitted change in the devbridge-v3 monorepo,
+    // including the developer's own work-in-progress. The pathspec confines
+    // the commit to the project tree the agent is authorized for.
+    await this.git.add(["-A", "."]);
     const commit = await this.git.commit(`[devbridge] ${message}`);
     const cp: GitCheckpoint = {
       sha: commit.commit,

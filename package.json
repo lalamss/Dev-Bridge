@@ -7,13 +7,19 @@
     "build": "turbo run build",
     "dev": "turbo run dev --parallel",
     "typecheck": "turbo run typecheck",
+    "test": "vitest run",
     "agent": "pnpm --filter @devbridge/local-agent dev",
     "cli": "pnpm --filter @devbridge/cli start",
     "example": "pnpm --filter @devbridge/example-react-vite dev"
   },
   "devDependencies": {
+    "@babel/preset-typescript": "^7.25.0",
     "turbo": "^2.1.0",
-    "typescript": "^5.6.0"
+    "typescript": "^5.6.0",
+    "vitest": "2.1.9"
   },
-  "packageManager": "pnpm@9.7.0"
+  "packageManager": "pnpm@9.7.0",
+  "dependencies": {
+    "@types/node": "^20.0.0"
+  }
 }

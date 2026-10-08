@@ -1,1 +1,1 @@
-export * from "./GitManager";
+export * from "./GitManager.js";

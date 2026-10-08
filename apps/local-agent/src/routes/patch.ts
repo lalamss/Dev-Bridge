@@ -1,15 +1,22 @@
 import { Router } from "express";
 import { z } from "zod";
+import {
+  MAX_DEVID_LENGTH,
+  MAX_PATH_LENGTH,
+} from "@devbridge/protocol";
 import type { ProjectManager } from "../ProjectManager";
-import { PatchConflictError } from "@devbridge/patch-engine";
+import { PatchConflictError, PatchNotFoundError, PatchWriteError } from "@devbridge/patch-engine";
 import { PathEscapeError, AIPermissionDeniedError } from "../SecurityManager";
 import type { EventBus } from "../ws/eventBus";
 
+/** Largest single file the agent will accept for a patch (express allows 5mb of JSON). */
+const MAX_PATCH_BYTES = 2 * 1024 * 1024;
+
 const CreatePatchSchema = z.object({
-  file: z.string().min(1),
-  newContent: z.string(),
+  file: z.string().min(1).max(MAX_PATH_LENGTH),
+  newContent: z.string().max(MAX_PATCH_BYTES),
   origin: z.enum(["manual", "ai", "token-sync"]),
-  devId: z.string().optional(),
+  devId: z.string().max(MAX_DEVID_LENGTH).optional(),
   aiCategory: z.enum(["styling", "accessibility", "tests", "logic", "backend", "dependencies"]).optional(),
   riskInput: z
     .object({
@@ -72,9 +79,15 @@ export function patchRoutes(project: ProjectManager, events: EventBus): Router {
   // GET /patch/:id/diff — recompute against current disk state (section 13: "Diff")
   router.get("/patch/:id/diff", (req, res) => {
     try {
-      res.json({ diff: project.patches.diffAgainstDisk(project.root, req.params.id) });
-    } catch {
-      res.status(404).json({ error: "patch not found" });
+      res.json({
+        diff: project.patches.diffAgainstDisk(project.root, req.params.id, {
+          checkFile: (abs) => project.security.assertPathInProject(abs),
+        }),
+      });
+    } catch (err) {
+      if (err instanceof PatchNotFoundError) return res.status(404).json({ error: "patch not found" });
+      if (err instanceof PathEscapeError) return res.status(403).json({ error: (err as Error).message });
+      res.status(500).json({ error: "could not read the current file" });
     }
   });
 
@@ -103,17 +116,37 @@ export function patchRoutes(project: ProjectManager, events: EventBus): Router {
   });
 
   // POST /patch/:id/apply — the only route that ever writes to disk.
+  // Status contract (the panel distinguishes all of these):
+  //   200 patch applied; 409 source changed/deleted since preview;
+  //   404 unknown id (or agent restarted and lost in-memory proposals);
+  //   403 path escapes the project root; 500 write/replacement failure.
   router.post("/patch/:id/apply", (req, res) => {
     try {
-      const patch = project.patches.apply(project.root, req.params.id);
+      const patch = project.patches.apply(project.root, req.params.id, {
+        // P4: the canonical guard runs inside apply(), on the exact path
+        // that is hashed and written — a symlink/junction swapped in after
+        // preview is refused here, not followed.
+        checkFile: (abs) => project.security.assertPathInProject(abs),
+      });
       events.broadcast("patch.applied", patch);
       events.broadcast("file.changed", { files: [patch.file] });
       res.json(patch);
     } catch (err) {
       if (err instanceof PatchConflictError) {
-        return res.status(409).json({ error: err.message, status: "conflicted" });
+        return res.status(409).json({ error: err.message, status: "conflicted", reason: err.reason });
       }
-      res.status(404).json({ error: (err as Error).message });
+      if (err instanceof PatchNotFoundError) {
+        return res.status(404).json({ error: "patch not found" });
+      }
+      if (err instanceof PathEscapeError) {
+        return res.status(403).json({ error: (err as Error).message });
+      }
+      if (err instanceof PatchWriteError) {
+        // Sanitized by construction: PatchWriteError carries only the
+        // project-relative file, never an absolute path.
+        return res.status(500).json({ error: (err as Error).message, code: "write-failed" });
+      }
+      res.status(500).json({ error: "patch apply failed" });
     }
   });
 

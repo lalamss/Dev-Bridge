@@ -3,7 +3,7 @@ import { join } from "node:path";
 import * as babel from "@babel/core";
 import type { FrameworkAdapter } from "@devbridge/framework-core";
 import type { ComponentInfo, DevIdentity, RenderEvent, SourceLocation, StateSnapshot } from "@devbridge/protocol";
-import { devIdentityBabelPlugin } from "./babelPlugin";
+import { devIdentityBabelPlugin } from "./babelPlugin.js";
 
 /**
  * ReactAdapter — see architecture doc section 21-22.

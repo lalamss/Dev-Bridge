@@ -1,10 +1,13 @@
 import { Router } from "express";
 import { z } from "zod";
-import { DevIdentitySchema } from "@devbridge/protocol";
+import { DevIdentitySchema, MAX_BULK_IDENTITIES } from "@devbridge/protocol";
 import type { ProjectManager } from "../ProjectManager";
+import { PathEscapeError } from "../SecurityManager";
 import type { EventBus } from "../ws/eventBus";
 
-const BulkIdentitySchema = z.object({ identities: z.array(DevIdentitySchema) });
+const BulkIdentitySchema = z.object({
+  identities: z.array(DevIdentitySchema).max(MAX_BULK_IDENTITIES),
+});
 
 export function projectRoutes(project: ProjectManager, events: EventBus): Router {
   const router = Router();
@@ -22,9 +25,25 @@ export function projectRoutes(project: ProjectManager, events: EventBus): Router
   });
 
   // POST /identity/bulk — called by the Vite plugin on every transform (plugins/vite/src/index.ts)
+  //
+  // All-or-nothing (audit A3): schema and size checks run first (no
+  // filesystem work for malformed requests), then EVERY source file is
+  // containment-checked against the canonical project root, and only then is
+  // anything upserted. One escaping or malformed item rejects the whole
+  // batch — a single poisoned `source.file` (traversal, symlink, junction,
+  // absolute outside path) can never create a partial registry that later
+  // feeds GET /source. Contract unchanged: 204 on success.
   router.post("/identity/bulk", (req, res) => {
     const parsed = BulkIdentitySchema.safeParse(req.body);
     if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
+
+    try {
+      const files = [...new Set(parsed.data.identities.map((i) => i.source.file))];
+      for (const file of files) project.security.assertPathInProject(file);
+    } catch (err) {
+      if (err instanceof PathEscapeError) return res.status(403).json({ error: err.message });
+      return res.status(400).json({ error: "invalid identity source file" });
+    }
 
     project.identities.upsertMany(parsed.data.identities);
     events.broadcast("file.changed", {
