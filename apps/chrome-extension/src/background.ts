@@ -46,6 +46,16 @@ const PANEL_TO_CONTENT = new Set([
   "devbridge:locate-element",
   "devbridge:preview-css",
   "devbridge:revert-preview",
+  "devbridge:get-page-info",
+  "devbridge:locate-devids",
+]);
+
+/** Messages a content script may send up to the panel/devtools relay. */
+const CONTENT_TO_PANEL = new Set([
+  "devbridge:element-selected",
+  "devbridge:inspecting-changed",
+  "devbridge:page-info",
+  "devbridge:locate-result",
 ]);
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -128,7 +138,7 @@ async function forwardToContentScript(tabId: number, message: { type: string } &
 // ─────────────────────────────────────────────────────────────────────────────
 
 chrome.runtime.onMessage.addListener((message, sender) => {
-  if (message?.type !== "devbridge:element-selected" && message?.type !== "devbridge:inspecting-changed") {
+  if (!message || !CONTENT_TO_PANEL.has(message.type)) {
     return false;
   }
 

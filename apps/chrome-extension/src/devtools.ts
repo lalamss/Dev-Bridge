@@ -13,6 +13,11 @@
  */
 
 import { DEVTOOLS_PORT_PREFIX } from "./portRouting";
+import {
+  isContextInvalidatedError,
+  isExtensionContextValid,
+  shouldRetryConnect,
+} from "./extensionContext";
 
 const tabId = chrome.devtools.inspectedWindow.tabId;
 
@@ -23,7 +28,23 @@ let port: chrome.runtime.Port | null = null;
 let retryTimer: ReturnType<typeof setTimeout> | undefined;
 
 function connect(): void {
-  port = chrome.runtime.connect({ name: `${DEVTOOLS_PORT_PREFIX}${tabId}` });
+  // Stale DevTools document (extension reloaded while open): any chrome.*
+  // call throws "Extension context invalidated" — park quietly instead of
+  // throwing uncaught out of the retry timer. Only reopening DevTools mints
+  // a fresh context.
+  if (!isExtensionContextValid()) {
+    port = null;
+    return;
+  }
+  try {
+    port = chrome.runtime.connect({ name: `${DEVTOOLS_PORT_PREFIX}${tabId}` });
+  } catch (e) {
+    if (isContextInvalidatedError(e)) {
+      port = null;
+      return;
+    }
+    throw e;
+  }
 
   // The worker only routes selections here while the panel is closed. There
   // is no UI in this document to show them — but the listener must exist:
@@ -42,16 +63,21 @@ function connect(): void {
   port.onDisconnect.addListener(() => {
     port = null;
     if (retryTimer) clearTimeout(retryTimer);
-    retryTimer = setTimeout(connect, RECONNECT_DELAY);
+    // Same lifecycle rule as the panel: a dead context must not schedule a
+    // retry — the retry's `chrome.runtime.connect` would throw uncaught.
+    if (shouldRetryConnect(false, isExtensionContextValid())) {
+      retryTimer = setTimeout(connect, RECONNECT_DELAY);
+    }
   });
 }
 
 connect();
 
 // The worker can be torn down while DevTools stays open; on every inspected
-// page navigation we make sure a port is live again.
+// page navigation we make sure a port is live again — unless the context is
+// dead, in which case connecting would throw uncaught.
 chrome.devtools.network.onNavigated.addListener(() => {
-  if (!port) {
+  if (!port && isExtensionContextValid()) {
     if (retryTimer) clearTimeout(retryTimer);
     connect();
   }

@@ -188,6 +188,78 @@ export interface ProjectInfo {
 }
 
 // ---------------------------------------------------------------------------
+// Bidirectional bridge: project connection (browser <-> source)
+// ---------------------------------------------------------------------------
+//
+// The agent serves exactly one project per process (v1). `projectId` is the
+// ProjectInfo.id (the canonical root) — stable per machine and checkout, and
+// echoed back on every mutating request so a request meant for Project A can
+// never be honored by Project B's agent. Framework-specific instrumentation
+// stays in adapters/plugins; this layer only carries identities.
+
+/** What the agent can do for its project, as seen by the extension panel. */
+export interface ProjectCapabilities {
+  /** Build-plugin identities are flowing (registry is non-empty). */
+  instrumentation: boolean;
+  /** Local editor integration is available (`code` CLI probe). */
+  editor: boolean;
+}
+
+/**
+ * The connection record the panel builds from GET /project plus its own
+ * page probe. Stronger than a bare dev-server origin: origin + projectId +
+ * framework must all agree before source operations are offered.
+ */
+export interface ProjectConnection {
+  projectId: string;
+  root: string;
+  framework: ProjectInfo["framework"];
+  devServerOrigin?: string;
+  capabilities: ProjectCapabilities;
+}
+
+/** Browser -> source: ask the agent to open a project file in the editor. */
+export interface OpenSourceRequest {
+  projectId: string;
+  file: string; // project-relative, e.g. "src/pages/Dashboard.tsx"
+  line: number; // 1-based
+  column: number; // 0-based
+}
+
+export interface OpenSourceResult {
+  ok: true;
+  file: string;
+  line: number;
+  column: number;
+}
+
+/** Facts the content script reports about its page (port message). */
+export interface PageInfo {
+  origin: string;
+  url: string;
+  instrumented: boolean;
+  identityCount: number;
+}
+
+/** Source -> browser: ask the page to find live DOM nodes for devIds. */
+export interface LocateDevIdsCommand {
+  requestId: string;
+  devIds: string[];
+}
+
+/** Per-identity live-instance count reported back by the content script. */
+export interface RuntimeMatch {
+  devId: string;
+  instances: number;
+}
+
+export interface LocateRuntimeResult {
+  requestId: string;
+  file: string;
+  matches: RuntimeMatch[];
+}
+
+// ---------------------------------------------------------------------------
 // WebSocket event envelope (section 50-51)
 // ---------------------------------------------------------------------------
 

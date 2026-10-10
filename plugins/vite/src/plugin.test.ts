@@ -159,3 +159,63 @@ describe("devbridgePlugin agent-root agreement (Batch 6)", () => {
     expect(warn).not.toHaveBeenCalled();
   });
 });
+
+describe("devbridgePlugin dev-server report (project detection)", () => {
+  function makeServingPlugin() {
+    const plugin = makePlugin() as unknown as {
+      configResolved: (config: unknown) => void;
+      configureServer: (server: unknown) => void;
+    };
+    return plugin;
+  }
+
+  function fakeServer(port: number) {
+    const listeners = new Map<string, () => void>();
+    return {
+      listeners,
+      server: {
+        config: { server: { port } },
+        httpServer: {
+          once: (event: string, cb: () => void) => {
+            listeners.set(event, cb);
+          },
+          address: () => ({ port }),
+        },
+      },
+    };
+  }
+
+  function devServerPosts() {
+    const calls = vi.mocked(fetch).mock.calls as [string, { method?: string; body?: string }][];
+    return calls.filter(([url, init]) => url.endsWith("/project/dev-server") && init?.method === "POST");
+  }
+
+  it("POSTs the loopback origin once the server is listening", async () => {
+    const plugin = makeServingPlugin();
+    plugin.configResolved({ command: "serve", root: "/proj" });
+    const { listeners, server } = fakeServer(5199);
+    plugin.configureServer(server);
+    listeners.get("listening")!();
+    await new Promise((r) => setTimeout(r, 10));
+    const posts = devServerPosts();
+    expect(posts).toHaveLength(1);
+    expect(JSON.parse(posts[0]![1].body!)).toEqual({ url: "http://127.0.0.1:5199" });
+  });
+
+  it("never throws when the agent is down (best-effort report)", async () => {
+    vi.mocked(fetch).mockRejectedValue(new Error("ECONNREFUSED"));
+    const plugin = makeServingPlugin();
+    plugin.configResolved({ command: "serve", root: "/proj" });
+    const { listeners, server } = fakeServer(5199);
+    expect(() => plugin.configureServer(server)).not.toThrow();
+    listeners.get("listening")!();
+    await new Promise((r) => setTimeout(r, 10));
+  });
+
+  it("does nothing when there is no http server", () => {
+    const plugin = makeServingPlugin();
+    plugin.configResolved({ command: "serve", root: "/proj" });
+    expect(() => plugin.configureServer({ config: { server: {} }, httpServer: null })).not.toThrow();
+    expect(devServerPosts()).toHaveLength(0);
+  });
+});

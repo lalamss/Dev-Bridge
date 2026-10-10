@@ -8,6 +8,8 @@ import { EventBus } from "./ws/eventBus";
 import { handleRuntimeFrame, runtimeErrorEnvelope } from "./ws/runtime";
 import { projectRoutes } from "./routes/project";
 import { sourceRoutes } from "./routes/source";
+import { filesRoutes } from "./routes/files";
+import { editorRoutes } from "./routes/editor";
 import { patchRoutes } from "./routes/patch";
 import { gitRoutes } from "./routes/git";
 import { stateRoutes } from "./routes/state";
@@ -60,6 +62,8 @@ app.use(express.json({ limit: "5mb" }));
 
 app.use(projectRoutes(project, events));
 app.use(sourceRoutes(project));
+app.use(filesRoutes(project));
+app.use(editorRoutes(project));
 app.use(patchRoutes(project, events));
 app.use(gitRoutes(project));
 app.use(stateRoutes(states));  // ← new

@@ -1,6 +1,6 @@
 import { Router } from "express";
 import { z } from "zod";
-import { DevIdentitySchema, MAX_BULK_IDENTITIES } from "@devbridge/protocol";
+import { DevIdentitySchema, DevServerReportSchema, MAX_BULK_IDENTITIES } from "@devbridge/protocol";
 import type { ProjectManager } from "../ProjectManager";
 import { PathEscapeError } from "../SecurityManager";
 import type { EventBus } from "../ws/eventBus";
@@ -56,6 +56,36 @@ export function projectRoutes(project: ProjectManager, events: EventBus): Router
   router.get("/identities", (req, res) => {
     const file = typeof req.query.file === "string" ? req.query.file : undefined;
     res.json(file ? project.identities.forFile(file) : project.identities.all());
+  });
+
+  // POST /project/dev-server { url } — the build plugin reports the origin
+  // serving the instrumented app, so the panel can match an inspected page to
+  // THIS project (Phase 5: project detection). Two-project disambiguation
+  // ("A on :5173" vs "B on :3000") works because each single-project agent
+  // reports its own origin and the panel additionally requires identity
+  // resolution to succeed before offering source operations.
+  //
+  // Handshake semantics: only a non-browser client may report. Browsers
+  // always send an Origin header on POST; the Vite plugin's fetch sends
+  // none. A random webpage therefore cannot claim "I am this project" —
+  // and even a loopback page cannot register a non-loopback origin.
+  router.post("/project/dev-server", (req, res) => {
+    if (req.get("origin")) {
+      return res.status(403).json({ error: "dev-server origin may only be reported by the local build process" });
+    }
+    const parsed = DevServerReportSchema.safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
+    let origin: string;
+    try {
+      const u = new URL(parsed.data.url);
+      if (u.protocol !== "http:") throw new Error("not http");
+      if (u.hostname !== "localhost" && u.hostname !== "127.0.0.1") throw new Error("not loopback");
+      origin = u.origin;
+    } catch {
+      return res.status(400).json({ error: "url must be a loopback http origin (http://localhost:<port>)" });
+    }
+    project.setDevServerUrl(origin);
+    res.json({ ok: true, devServerUrl: origin });
   });
 
   return router;

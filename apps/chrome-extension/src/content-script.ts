@@ -198,6 +198,14 @@ function boot(): void {
       case "devbridge:locate-element":
         if (typeof message.devId === "string") locateElement(message.devId);
         break;
+      case "devbridge:get-page-info":
+        reportPageInfo();
+        break;
+      case "devbridge:locate-devids":
+        if (typeof message.requestId === "string" && Array.isArray(message.devIds)) {
+          locateDevIds(message.requestId, message.devIds);
+        }
+        break;
       case "devbridge:preview-css":
         injectCSSPreview(message.content ?? "");
         break;
@@ -207,6 +215,105 @@ function boot(): void {
     }
   });
 
+  // ─────────────────────────────────────────────────────────────
+  // Project detection + source -> browser (bidirectional bridge)
+  //
+  // reportPageInfo answers the panel's "is this page a DevBridge project?"
+  // probe with facts only the page can observe: its own origin/URL and
+  // whether build-plugin identities (data-dev-id) are present. The panel —
+  // never the page — decides what counts as connected, and the page can
+  // claim nothing about project roots or filesystems.
+  // ─────────────────────────────────────────────────────────────
+
+  function reportPageInfo(): void {
+    let identityCount = 0;
+    try {
+      identityCount = document.querySelectorAll("[data-dev-id]").length;
+    } catch {
+      identityCount = 0;
+    }
+    try {
+      chrome.runtime.sendMessage({
+        type: "devbridge:page-info",
+        origin: location.origin,
+        url: location.href,
+        instrumented: identityCount > 0,
+        identityCount,
+      });
+    } catch {
+      // Worker unreachable (restarting) — the panel resyncs on reconnect.
+    }
+  }
+
+  // Multi-instance highlight layer for source -> browser lookups. Separate
+  // from the single-selection overlay: one box per live node, cleared on the
+  // next locate, on inspect start, or after a short dwell.
+  let locateBoxes: HTMLDivElement[] = [];
+  let locateTimer2: ReturnType<typeof setTimeout> | undefined;
+
+  function clearLocateBoxes(): void {
+    for (const box of locateBoxes) box.remove();
+    locateBoxes = [];
+    if (locateTimer2) {
+      clearTimeout(locateTimer2);
+      locateTimer2 = undefined;
+    }
+  }
+
+  function drawLocateBox(el: HTMLElement): void {
+    const rect = el.getBoundingClientRect();
+    if (rect.width === 0 && rect.height === 0) return;
+    const box = document.createElement("div");
+    box.style.cssText = `
+    position: fixed; pointer-events: none; z-index: 2147483646;
+    border: 2px dashed #7c3aed; background: rgba(124, 58, 237, 0.12);
+    left: ${rect.left}px; top: ${rect.top}px;
+    width: ${rect.width}px; height: ${rect.height}px;
+  `;
+    document.documentElement.appendChild(box);
+    locateBoxes.push(box);
+  }
+
+  /**
+   * Source -> browser: find live DOM nodes for instrumented devIds.
+   * A component can render zero, one, or many instances — every devId is
+   * counted with a real DOM query (never text/CSS guessing) and the counts
+   * are reported back so the panel can offer per-instance jumps.
+   */
+  function locateDevIds(requestId: string, devIds: unknown): void {
+    const matches: Array<{ devId: string; instances: number }> = [];
+    clearLocateBoxes();
+    let firstEl: HTMLElement | null = null;
+    const ids = Array.isArray(devIds) ? devIds.slice(0, 200) : [];
+    for (const raw of ids) {
+      if (typeof raw !== "string" || !/^dvi_[a-f0-9]+$/.test(raw)) continue;
+      let nodes: NodeListOf<HTMLElement>;
+      try {
+        nodes = document.querySelectorAll<HTMLElement>(`[data-dev-id="${CSS.escape(raw)}"]`);
+      } catch {
+        matches.push({ devId: raw, instances: 0 });
+        continue;
+      }
+      matches.push({ devId: raw, instances: nodes.length });
+      nodes.forEach((el) => {
+        if (!firstEl) firstEl = el;
+        drawLocateBox(el);
+      });
+    }
+    if (firstEl) {
+      try {
+        (firstEl as HTMLElement).scrollIntoView({ behavior: "smooth", block: "center" });
+      } catch {
+        /* non-visual context */
+      }
+    }
+    locateTimer2 = setTimeout(clearLocateBoxes, 4000);
+    try {
+      chrome.runtime.sendMessage({ type: "devbridge:locate-result", requestId, matches });
+    } catch {
+      // Worker unreachable — boxes still show locally; panel times out.
+    }
+  }
   // ─────────────────────────────────────────────────────────────
   // Visual preview (CSS hotswap) — section 15 / feature #10
   //

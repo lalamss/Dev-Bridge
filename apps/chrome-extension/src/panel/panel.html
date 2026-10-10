@@ -6,7 +6,35 @@
   <title>DevBridge</title>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-    html, body, #root { height: 100%; background: #0f172a; }
+    html, body, #root { height: 100%; background: #16181d; }
+    /* Subtle, consistent interaction states (inline styles can't do :hover). */
+    .db-btn:hover:not(:disabled) { background: #2a2e38; border-color: #3f3f46; }
+    .db-btn:disabled { cursor: not-allowed; opacity: 0.5; }
+    .db-btn:focus-visible, .db-tab:focus-visible, .db-summary:focus-visible,
+    .db-rail-btn:focus-visible, .db-card:focus-visible, .db-row:focus-visible,
+    .db-search:focus-visible, .db-welcome-cta:focus-visible {
+      outline: 1px solid #9d8cff; outline-offset: 1px;
+    }
+    /* Centered welcome primary action: subtle violet accent, clear states. */
+    .db-welcome-cta { transition: background 0.15s ease, border-color 0.15s ease; }
+    .db-welcome-cta:hover:not(:disabled) { background: #7c6cf0; border-color: #7c6cf0; }
+    .db-welcome-cta:focus-visible { outline: 2px solid #9d8cff; outline-offset: 2px; }
+    .db-welcome-cta:disabled { cursor: not-allowed; opacity: 0.5; }
+    @media (prefers-reduced-motion: reduce) {
+      .db-welcome-cta { transition: none; }
+    }
+    .db-btn-primary:hover:not(:disabled) { background: #7c6cf0; border-color: #7c6cf0; }
+    .db-btn-cyan:hover:not(:disabled) { background: rgba(103, 232, 249, 0.08); border-color: #67e8f9; }
+    .db-tab:hover:not(:disabled) { color: #e4e4e7; }
+    .db-tab:disabled { cursor: not-allowed; opacity: 0.4; }
+    .db-rail-btn:hover { color: #e4e4e7; background: #1e2129; }
+    .db-card:hover:not(:disabled) { border-color: #3f3f46; }
+    .db-row:hover { background: #1e2129; }
+    .db-summary:hover { color: #e4e4e7; }
+    .db-summary::marker { color: #71717a; font-size: 10px; }
+    @media (max-width: 560px) {
+      .db-hide-narrow { display: none; }
+    }
   </style>
   <!-- Monaco AMD loader — vendored locally by copy-assets.cjs.
        A remote CDN loader is blocked here: Chrome applies the extension's

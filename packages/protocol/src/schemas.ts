@@ -42,6 +42,30 @@ export const DevIdentitySchema = z.object({
   runtimeInstance: z.string().max(MAX_DEVID_LENGTH).optional(),
 });
 
+// ---------------------------------------------------------------------------
+// Bidirectional bridge (browser <-> source). Validated at the agent boundary;
+// the extension mirrors these shapes without importing this package (its
+// bundle keeps zero Node deps — see panel/App.tsx header).
+// ---------------------------------------------------------------------------
+
+/** Highest 1-based source line the editor-open route will accept. */
+export const MAX_SOURCE_LINE = 1000000;
+/** Most devIds accepted in a single locate round-trip. */
+export const MAX_LOCATE_DEVIDS = 200;
+
+export const OpenSourceRequestSchema = z.object({
+  projectId: z.string().min(1).max(MAX_PATH_LENGTH),
+  file: z.string().min(1).max(MAX_PATH_LENGTH),
+  line: z.number().int().positive().max(MAX_SOURCE_LINE),
+  column: z.number().int().nonnegative().max(MAX_SOURCE_LINE),
+});
+
+export const DevServerReportSchema = z.object({
+  /** The dev-server origin serving the instrumented app, e.g. "http://127.0.0.1:5173". */
+  url: z.string().min(1).max(256),
+});
+export type DevServerReport = z.infer<typeof DevServerReportSchema>;
+
 export const PatchRequestSchema = z.object({
   file: z.string().min(1),
   originalHash: z.string().min(1),

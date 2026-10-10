@@ -37,9 +37,19 @@ declare global {
  * `MonacoEnvironment` is declared on Window by monaco-editor's own type
  * definitions, so it is assigned through `window` rather than redeclared
  * here — a second declaration would conflict on type.
+ *
+ * The base URL is resolved ONCE at boot: this module only ever evaluates in
+ * a freshly loaded extension page, whose context is necessarily valid.
+ * Caching it removes the lazy `chrome.runtime.getURL` call from
+ * `getWorkerUrl`, which Monaco invokes on every worker spawn — including,
+ * for a stale panel left open across an extension reload, AFTER the context
+ * died, where it threw "Extension context invalidated" uncaught (once per
+ * spawn, hence the repeated Errors-page entries).
  */
+const vsBaseUrl = chrome.runtime.getURL("vs");
+
 window.MonacoEnvironment = {
-  getWorkerUrl: () => chrome.runtime.getURL("vs/base/worker/workerMain.js"),
+  getWorkerUrl: () => `${vsBaseUrl}/base/worker/workerMain.js`,
 };
 
 function boot() {
@@ -53,7 +63,7 @@ if (window.monaco) {
   boot();
 } else if (window.require) {
   window.require.config({
-    paths: { vs: chrome.runtime.getURL("vs") },
+    paths: { vs: vsBaseUrl },
   });
   window.require(["vs/editor/editor.main"], boot);
 } else {

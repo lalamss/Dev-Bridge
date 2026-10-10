@@ -1,24 +1,43 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { identityMissingMessage, sourceFailureMessage } from "./sourceMessage";
-
-// ─────────────────────────────────────────────────────────────
-// Types (mirrors @devbridge/protocol — inlined so the extension
-// bundle has zero Node deps)
-// ─────────────────────────────────────────────────────────────
-
-const AGENT = "http://localhost:4577";
-const AGENT_WS = "ws://localhost:4577/events";
-const PANEL_PORT_PREFIX = "devbridge-panel-";
-const RECONNECT_DELAY = 500;
-
-type PatchStatus = "proposed" | "previewed" | "approved" | "applied" | "rejected" | "conflicted";
-type RiskLevel   = "low" | "medium" | "high";
-
-interface SourceLocation { file: string; start: { line: number; column: number }; }
-interface DevIdentity    { id: string; component: string | null; source: SourceLocation; parentId: string | null; }
-interface StateSnapshot  { devId: string; props: Record<string,unknown>; state: Record<string,unknown>; context: Record<string,unknown>; timestamp: string; }
-interface SourcePatch    { id: string; file: string; diff: string; status: PatchStatus; risk: RiskLevel; riskReasons: string[]; origin: string; }
-interface GitCheckpoint  { sha: string; message: string; testsPassing: boolean | null; timestamp: string; }
+import {
+  isContextInvalidatedError,
+  isExtensionContextValid,
+  shouldRetryConnect,
+} from "../extensionContext";
+import { C, S, MONO_FONT } from "./theme";
+import type {
+  AgentProject,
+  DevIdentity,
+  GitCheckpoint,
+  PageInfo,
+  RuntimeMatch,
+  SourcePatch,
+  StateSnapshot,
+} from "./theme";
+import {
+  AGENT_WS,
+  approveAndApply,
+  createCheckpoint,
+  createPatch,
+  getIdentities,
+  getIdentity,
+  getSource,
+  getStateSnapshot,
+  getProject,
+  openInEditor,
+  previewPatch,
+  rejectPatch,
+  rollbackCheckpoint,
+} from "./api";
+import type { EditorTab, PanelView } from "./navigation";
+import { chromeLocalPrefsStore, DEFAULT_PREFERENCES, type PanelPreferences } from "./preferences";
+import { Header } from "./components/Header";
+import { NavRail } from "./components/NavRail";
+import { InspectLanding } from "./views/InspectLanding";
+import { ComponentsView } from "./views/ComponentsView";
+import { FilesView } from "./views/FilesView";
+import { SettingsView } from "./views/SettingsView";
 
 // ─────────────────────────────────────────────────────────────
 // Transport
@@ -31,27 +50,64 @@ interface GitCheckpoint  { sha: string; message: string; testsPassing: boolean |
 // element-selected events to whichever document is currently listening.
 // ─────────────────────────────────────────────────────────────
 
+const PANEL_PORT_PREFIX = "devbridge-panel-";
+const RECONNECT_DELAY = 500;
+
 function usePanelPort() {
   const [port, setPort] = useState<chrome.runtime.Port | null>(null);
   const [connected, setConnected] = useState(false);
+  // True once this document's extension context has died (extension
+  // reloaded/updated/disabled while DevTools stayed open). The stale page
+  // parks here instead of throwing "Extension context invalidated" uncaught
+  // out of the reconnect timer — only reopening DevTools mints a fresh
+  // context, so the hint says exactly that.
+  const [invalidated, setInvalidated] = useState(false);
 
   useEffect(() => {
     let disposed = false;
     let current: chrome.runtime.Port | null = null;
     let retry: ReturnType<typeof setTimeout> | undefined;
 
+    const parkAsInvalidated = () => {
+      current = null;
+      setPort(null);
+      setConnected(false);
+      setInvalidated(true);
+    };
+
     const connect = () => {
       if (disposed) return;
-      const tabId = chrome.devtools.inspectedWindow.tabId;
-      const p = chrome.runtime.connect({ name: `${PANEL_PORT_PREFIX}${tabId}` });
+      if (!isExtensionContextValid()) {
+        parkAsInvalidated();
+        return;
+      }
+      let p: chrome.runtime.Port;
+      try {
+        const tabId = chrome.devtools.inspectedWindow.tabId;
+        p = chrome.runtime.connect({ name: `${PANEL_PORT_PREFIX}${tabId}` });
+      } catch (e) {
+        // The context can die between the probe above and the call. Absorb
+        // ONLY the invalidation signal; anything else still throws.
+        if (isContextInvalidatedError(e)) {
+          parkAsInvalidated();
+          return;
+        }
+        throw e;
+      }
       current = p;
       setPort(p);
       setConnected(true);
+      setInvalidated(false);
       p.onDisconnect.addListener(() => {
         setConnected(false);
         // MV3 suspends idle service workers, so the port can drop at any
         // time — silently re-establish it rather than dead-ending the panel.
-        if (!disposed) retry = setTimeout(connect, RECONNECT_DELAY);
+        // From a dead context the retry itself would throw uncaught, so park.
+        if (shouldRetryConnect(disposed, isExtensionContextValid())) {
+          retry = setTimeout(connect, RECONNECT_DELAY);
+        } else if (!disposed) {
+          parkAsInvalidated();
+        }
       });
     };
 
@@ -60,26 +116,74 @@ function usePanelPort() {
     return () => {
       disposed = true;
       if (retry) clearTimeout(retry);
-      current?.disconnect();
+      if (isExtensionContextValid()) {
+        try {
+          current?.disconnect();
+        } catch (e) {
+          if (!isContextInvalidatedError(e)) throw e;
+        }
+      }
     };
   }, []);
 
   const send = useCallback((message: Record<string, unknown>) => {
-    port?.postMessage(message);
+    if (!port || !isExtensionContextValid()) return;
+    try {
+      port.postMessage(message);
+    } catch (e) {
+      if (isContextInvalidatedError(e)) {
+        setConnected(false);
+        setInvalidated(true);
+        return;
+      }
+      throw e;
+    }
   }, [port]);
 
-  return { port, connected, send };
+  return { port, connected, invalidated, send };
 }
 
 // ─────────────────────────────────────────────────────────────
-// View states for the panel
+// Project connection (Phase 5): the agent's project vs this page —
+//
+// Connected requires ALL of: the agent answers, the page reports
+// build-plugin identities, and — when the agent knows its dev-server
+// origin — the page origin matches it. Identity resolution on selection
+// is the final proof: a page that passes the origin check but resolves
+// nothing is still treated as unconnected for source operations.
 // ─────────────────────────────────────────────────────────────
-type View = "editor" | "diff" | "applied";
+
+export type ConnectionState =
+  | { kind: "no-agent" }
+  | { kind: "unknown-page" }
+  | { kind: "uninstrumented" }
+  | { kind: "mismatch"; expected: string; actual: string }
+  | { kind: "connected" };
 
 // ─────────────────────────────────────────────────────────────
 // Root
 // ─────────────────────────────────────────────────────────────
 export function App() {
+  // Navigation
+  const [nav, setNav] = useState<PanelView>("inspect");
+  const [componentsFileFilter, setComponentsFileFilter] = useState<string | null>(null);
+
+  // Preferences (persisted via chrome.storage.local w/ memory fallback)
+  const [prefs, setPrefs] = useState<PanelPreferences>(DEFAULT_PREFERENCES);
+  const prefsRef = useRef(prefs);
+  prefsRef.current = prefs;
+  useEffect(() => {
+    let cancelled = false;
+    chromeLocalPrefsStore.load().then((loaded) => {
+      if (!cancelled) setPrefs((p) => ({ ...p, ...loaded }));
+    }).catch(() => {});
+    return () => { cancelled = true; };
+  }, []);
+  function updatePrefs(next: PanelPreferences) {
+    setPrefs(next);
+    void chromeLocalPrefsStore.save(next);
+  }
+
   // Selection
   const [devId, setDevId]       = useState<string | null>(null);
   const [selectedTag, setSelectedTag] = useState<string | null>(null);
@@ -89,7 +193,7 @@ export function App() {
   const [liveTag, setLiveTag]   = useState(false);
 
   // Edit / patch flow
-  const [view, setView]         = useState<View>("editor");
+  const [view, setView]         = useState<EditorTab>("editor");
   const [patch, setPatch]       = useState<SourcePatch | null>(null);
   const [checkpoint, setCheckpoint] = useState<GitCheckpoint | null>(null);
   const [busy, setBusy]         = useState(false);
@@ -107,7 +211,41 @@ export function App() {
   const wsRef = useRef<WebSocket | null>(null);
 
   // Panel ⇄ background port (DevTools panels can't use sendMessage)
-  const { port, connected, send } = usePanelPort();
+  const { port, connected, invalidated, send } = usePanelPort();
+
+  // ── Project connection (Phase 5): the agent's project vs this page ──
+  const [agentProject, setAgentProject] = useState<AgentProject | null>(null);
+  const [agentReachable, setAgentReachable] = useState(true);
+  const [pageInfo, setPageInfo] = useState<PageInfo | null>(null);
+
+  // The agent's project. Fetched on mount; the agent is single-project per
+  // process, so this record IS the project identity the panel binds to.
+  const fetchProject = useCallback(async () => {
+    try {
+      const info = await getProject();
+      setAgentProject(info);
+      setAgentReachable(true);
+    } catch {
+      setAgentProject(null);
+      setAgentReachable(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void fetchProject();
+  }, [fetchProject]);
+
+  function refreshConnection() {
+    void fetchProject();
+    send({ type: "devbridge:get-page-info" });
+  }
+
+  // Ask the page for its facts whenever the port (re)connects. The panel —
+  // never the page — decides what counts as connected.
+  useEffect(() => {
+    if (!port || !connected) return;
+    send({ type: "devbridge:get-page-info" });
+  }, [port, connected, send]);
 
   // ── flash helper (audit X5: overlapping flashes raced — a stale timer
   // cleared a newer message early, and timers leaked on unmount) ──
@@ -140,21 +278,39 @@ export function App() {
   }, [port, connected, send]);
 
   // ── element selected (pushed down the port by the background worker) ──
+  // Pending source -> browser lookups, keyed by requestId. Entries resolve
+  // on the matching `devbridge:locate-result` or reject on timeout — a lost
+  // reply must surface, never hang the UI.
+  const locateSeq = useRef(0);
+  const pendingLocate = useRef(
+    new Map<string, { resolve: (m: RuntimeMatch[]) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> }>(),
+  );
+  useEffect(() => () => {
+    for (const [, p] of pendingLocate.current) clearTimeout(p.timer);
+    pendingLocate.current.clear();
+  }, []);
+
+  // Live instance counts, keyed by devId — filled by every locate-devids
+  // round trip so Components and the workspace share real numbers.
+  const [instanceCounts, setInstanceCounts] = useState<Map<string, number>>(new Map());
+
+  function locateDevIds(devIds: string[]): Promise<RuntimeMatch[]> {
+    const requestId = `loc-${(locateSeq.current += 1)}-${Date.now()}`;
+    return new Promise<RuntimeMatch[]>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        pendingLocate.current.delete(requestId);
+        reject(new Error("No response from the page — is the tab still open on the dev server?"));
+      }, 10000);
+      pendingLocate.current.set(requestId, { resolve, reject, timer });
+      send({ type: "devbridge:locate-devids", requestId, devIds });
+    });
+  }
+
   useEffect(() => {
     if (!port) return;
     const listener = (msg: any) => {
       if (msg?.type === "devbridge:element-selected") {
-        // Audit C5: a new selection resets EVERYTHING from the previous one.
-        // The old code kept `identity`/`source`, so a missing identity showed
-        // the previous element's file and line under the new devId.
-        setDevId(msg.devId ?? null);
-        setSelectedTag(typeof msg.tag === "string" ? msg.tag : null);
-        setIdentity(null);
-        setSource("");
-        setView("editor");
-        setPatch(null);
-        setCheckpoint(null);
-        setSnapshot(null);
+        resetSelection(msg.devId ?? null, typeof msg.tag === "string" ? msg.tag : null);
         if (!msg.devId) {
           // Audit C4: only a DOM node was identified — explain instead of
           // fabricating a source location.
@@ -164,6 +320,8 @@ export function App() {
               : `Selected element carries no DevBridge identity. Source mapping is unavailable.`,
             "warn",
           );
+        } else if (prefsRef.current.autoLocateOnSelect) {
+          send({ type: "devbridge:locate-element", devId: msg.devId });
         }
       }
       if (msg?.type === "devbridge:inspecting-changed") {
@@ -176,10 +334,60 @@ export function App() {
           "err",
         );
       }
+      if (msg?.type === "devbridge:page-info") {
+        setPageInfo({
+          origin: typeof msg.origin === "string" ? msg.origin : "",
+          url: typeof msg.url === "string" ? msg.url : "",
+          instrumented: Boolean(msg.instrumented),
+          identityCount: typeof msg.identityCount === "number" ? msg.identityCount : 0,
+        });
+      }
+      if (msg?.type === "devbridge:locate-result" && typeof msg.requestId === "string") {
+        const pending = pendingLocate.current.get(msg.requestId);
+        if (pending) {
+          pendingLocate.current.delete(msg.requestId);
+          clearTimeout(pending.timer);
+          const matches: RuntimeMatch[] = Array.isArray(msg.matches)
+            ? msg.matches
+                .filter((m: any) => m && typeof m.devId === "string" && typeof m.instances === "number")
+                .map((m: any) => ({ devId: m.devId, instances: m.instances }))
+            : [];
+          setInstanceCounts((prev) => {
+            const next = new Map(prev);
+            for (const m of matches) next.set(m.devId, m.instances);
+            return next;
+          });
+          pending.resolve(matches);
+        }
+      }
     };
     port.onMessage.addListener(listener);
     return () => port.onMessage.removeListener(listener);
-  }, [port]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [port, send]);
+
+  // Audit C5: a new selection resets EVERYTHING from the previous one. The
+  // old code kept `identity`/`source`, so a missing identity showed the
+  // previous element's file and line under the new devId.
+  function resetSelection(nextDevId: string | null, tag: string | null) {
+    setDevId(nextDevId);
+    setSelectedTag(tag);
+    setIdentity(null);
+    setSource("");
+    setView("editor");
+    setPatch(null);
+    setCheckpoint(null);
+    setSnapshot(null);
+    setLocateState({ status: "idle" });
+  }
+
+  // Selecting a component from the Components view shares the same state —
+  // the workspace then resolves its real identity and source.
+  function selectComponent(nextDevId: string) {
+    resetSelection(nextDevId, null);
+    setComponentsFileFilter(null);
+    setNav("inspect");
+  }
 
   // ── fetch identity + source ──
   useEffect(() => {
@@ -187,28 +395,27 @@ export function App() {
     let cancelled = false;
     (async () => {
       try {
-        const idRes = await fetch(`${AGENT}/identity/${devId}`);
-        if (idRes.status === 404) {
+        const id = await getIdentity(devId);
+        if (cancelled) return;
+        if (!id) {
           flash(identityMissingMessage(devId), "warn");
           return;
         }
-        if (!idRes.ok) throw new Error(`GET /identity -> ${idRes.status}`);
-        const id: DevIdentity = await idRes.json();
-        if (cancelled) return;
         setIdentity(id);
 
-        const srcRes = await fetch(`${AGENT}/source?file=${encodeURIComponent(id.source.file)}`);
-        // Batch 6: identity-hit + source-miss is the stale/wrong-root agent
-        // signature (reproduced live) — diagnose it precisely instead of
-        // claiming the agent is unreachable.
-        if (!srcRes.ok) {
-          flash(sourceFailureMessage(devId, id.source.file, srcRes.status), "warn");
+        try {
+          const content = await getSource(id.source.file);
+          if (!cancelled) setSource(content);
+        } catch (e: any) {
+          // Batch 6: identity-hit + source-miss is the stale/wrong-root agent
+          // signature (reproduced live) — diagnose it precisely instead of
+          // claiming the agent is unreachable.
+          const status = /-> (\d+)/.exec(e?.message ?? "")?.[1];
+          if (!cancelled) flash(sourceFailureMessage(devId, id.source.file, status ? Number(status) : 0), "warn");
           return;
         }
-        const d = await srcRes.json();
-        if (!cancelled) setSource(d.content ?? "");
-      } catch {
-        if (!cancelled) flash("Couldn't reach local agent — run devbridge start", "err");
+      } catch (e: any) {
+        if (!cancelled) flash(e?.message ?? "Couldn't reach local agent — run devbridge start", "err");
       }
     })();
     return () => { cancelled = true; };
@@ -217,10 +424,7 @@ export function App() {
   // ── fetch latest state snapshot ──
   useEffect(() => {
     if (!devId) return;
-    fetch(`${AGENT}/state/${devId}`)
-      .then(r => r.ok ? r.json() : null)
-      .then(d => d && setSnapshot(d))
-      .catch(() => {});
+    getStateSnapshot(devId).then((d) => d && setSnapshot(d));
   }, [devId]);
 
   // ── live WS for state.changed (audit X4: the old socket never
@@ -256,7 +460,7 @@ export function App() {
             setTimeout(() => setLiveTag(false), 800);
           }
           if (ev.type === "patch.applied") {
-            flash("Patch applied and saved to disk ✅", "ok");
+            flash("Patch applied and saved to disk.", "ok");
           }
         } catch {}
       };
@@ -321,7 +525,23 @@ export function App() {
     const column = (identity?.source.start.column ?? 0) + 1;
     editorRef.current.revealLineInCenter(line);
     editorRef.current.setPosition({ lineNumber: line, column });
-  }, [source, view]);
+  }, [source, view, identity]);
+
+  // The workspace unmounts visually when another nav view is active
+  // (display:none keeps Monaco's DOM alive); relayout on return so the
+  // editor repaints at the real size instead of staying collapsed.
+  useEffect(() => {
+    if (nav !== "inspect") return;
+    const t = requestAnimationFrame(() => {
+      try {
+        editorRef.current?.layout();
+        diffEditorRef.current?.layout();
+      } catch {
+        /* editor not mounted yet */
+      }
+    });
+    return () => cancelAnimationFrame(t);
+  }, [nav]);
 
   // ── Monaco: dispose everything on unmount (audit P6 — leaked models) ──
   useEffect(() => () => {
@@ -371,29 +591,7 @@ export function App() {
       padding: { top: 8, bottom: 8 },
     });
     diffEditorRef.current.setModel({ original: originalModel, modified: modifiedModel });
-  }, [view, patch]);
-
-  // ── Agent error mapping (Batch 3 §5). Every failure gets a distinct,
-  // actionable message; success is shown only after the agent confirms the
-  // write. `readAgentError` never surfaces absolute paths — the agent
-  // sanitizes them server-side, and anything unparseable degrades to the
-  // status-specific fallback below rather than raw HTML/text.
-  async function readAgentError(res: Response, fallback: string): Promise<string> {
-    try {
-      const body = await res.json();
-      if (body && typeof body.error === "string" && body.error.length > 0) return body.error;
-    } catch {
-      /* non-JSON error body — use the fallback */
-    }
-    return fallback;
-  }
-
-  function networkError(e: unknown): Error {
-    if (e instanceof TypeError) {
-      return new Error("Local agent unavailable — is `devbridge start` running on http://localhost:4577?");
-    }
-    return e as Error;
-  }
+  }, [view, patch, source]);
 
   // ── Create patch ──
   async function handleCreatePatch() {
@@ -411,32 +609,16 @@ export function App() {
     setBusy(true);
     try {
       const newContent = editorRef.current.getValue();
-      let res: Response;
-      try {
-        res = await fetch(`${AGENT}/patch`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            file: identity.source.file,
-            newContent,
-            origin: "manual",
-            devId,
-          }),
-        });
-      } catch (e) {
-        throw networkError(e);
-      }
-      if (res.status === 403) throw new Error(await readAgentError(res, "Refused: this file is outside the authorized project root."));
-      if (res.status === 400) throw new Error(await readAgentError(res, "Invalid patch request — the file or content was rejected by the agent."));
-      if (!res.ok) throw new Error(await readAgentError(res, `Patch proposal failed (agent said ${res.status}).`));
-      const p: SourcePatch = await res.json();
+      const p = await createPatch({ file: identity.source.file, newContent, devId });
       setPatch(p);
 
       // Mark previewed
-      await fetch(`${AGENT}/patch/${p.id}/preview`, { method: "POST" });
+      await previewPatch(p.id);
 
       // Inject CSS preview into running app via content script
-      injectVisualPreview(identity.source.file, newContent);
+      if (prefsRef.current.autoPreviewCss) {
+        injectVisualPreview(identity.source.file, newContent);
+      }
 
       setView("diff");
     } catch (e: any) {
@@ -451,43 +633,7 @@ export function App() {
     if (!patch) return;
     setBusy(true);
     try {
-      let approveRes: Response;
-      try {
-        approveRes = await fetch(`${AGENT}/patch/${patch.id}/approve`, { method: "POST" });
-      } catch (e) {
-        throw networkError(e);
-      }
-      // Audit P2: the old code neither awaited nor checked this — an approve
-      // failure was invisible and /apply proceeded anyway. Stop here instead.
-      if (approveRes.status === 404) throw new Error("Patch no longer exists on the agent (did it restart?). Re-select the element to propose again.");
-      if (!approveRes.ok) throw new Error(await readAgentError(approveRes, `Approve failed (agent said ${approveRes.status}). Nothing was written.`));
-
-      let res: Response;
-      try {
-        res = await fetch(`${AGENT}/patch/${patch.id}/apply`, { method: "POST" });
-      } catch (e) {
-        throw networkError(e);
-      }
-      if (res.status === 409) {
-        let reason = "";
-        try {
-          const body = await res.json();
-          reason = body?.reason === "deleted"
-            ? "The source file was deleted after the preview — nothing was written. "
-            : "The source file changed on disk since the preview — nothing was written. ";
-        } catch {
-          /* fall through with the generic conflict text */
-        }
-        throw new Error(`${reason}Re-select the element to reload and propose again.`);
-      }
-      if (res.status === 404) throw new Error("Patch no longer exists on the agent (did it restart?). Re-select the element to propose again.");
-      if (res.status === 403) throw new Error(await readAgentError(res, "Refused: this file is outside the authorized project root. Nothing was written."));
-      if (res.status === 500) throw new Error(await readAgentError(res, "The agent could not write the file (disk or permissions). Nothing was written."));
-      if (!res.ok) throw new Error(await readAgentError(res, `Apply failed (agent said ${res.status}). Nothing was written.`));
-      const applied: SourcePatch = await res.json();
-      // Success is shown only on confirmation: the agent must report back an
-      // applied patch, not just a 200.
-      if (applied.status !== "applied") throw new Error("Agent returned without confirming the write — treating as failed. Nothing is assumed about the file.");
+      const applied = await approveAndApply(patch.id);
       setPatch(applied);
 
       // Audit P7: the CSS live-preview tag mirrored the proposal; now that
@@ -496,12 +642,8 @@ export function App() {
       revertVisualPreview();
 
       // Git checkpoint
-      const cpRes = await fetch(`${AGENT}/git/checkpoint`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: `edit ${identity?.source.file} via DevBridge`, testsPassing: null }),
-      });
-      if (cpRes.ok) setCheckpoint(await cpRes.json());
+      const cp = await createCheckpoint(`edit ${identity?.source.file} via DevBridge`);
+      if (cp) setCheckpoint(cp);
 
       setView("applied");
     } catch (e: any) {
@@ -514,7 +656,7 @@ export function App() {
   // ── Reject ──
   async function handleReject() {
     if (!patch) return;
-    await fetch(`${AGENT}/patch/${patch.id}/reject`, { method: "POST" });
+    await rejectPatch(patch.id);
     revertVisualPreview();
     setPatch(null);
     setView("editor");
@@ -526,13 +668,8 @@ export function App() {
     if (!checkpoint) return;
     setBusy(true);
     try {
-      const res = await fetch(`${AGENT}/git/rollback`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ sha: checkpoint.sha }),
-      });
-      if (!res.ok) throw new Error(await res.text());
-      flash("Rolled back to previous commit ✅", "ok");
+      await rollbackCheckpoint(checkpoint.sha);
+      flash("Rolled back to previous commit.", "ok");
       setView("editor");
       setPatch(null);
       setCheckpoint(null);
@@ -564,6 +701,89 @@ export function App() {
     send({ type: "devbridge:locate-element", devId: id });
   }
 
+  const connection: ConnectionState = (() => {
+    if (!agentReachable || !agentProject) return { kind: "no-agent" };
+    if (!pageInfo) return { kind: "unknown-page" };
+    if (!pageInfo.instrumented) return { kind: "uninstrumented" };
+    if (agentProject.devServerUrl) {
+      let expected = "";
+      try {
+        expected = new URL(agentProject.devServerUrl).origin;
+      } catch {
+        expected = agentProject.devServerUrl;
+      }
+      if (pageInfo.origin !== expected) {
+        return { kind: "mismatch", expected, actual: pageInfo.origin };
+      }
+    }
+    return { kind: "connected" };
+  })();
+
+  // ── Browser -> source -> VS Code (Phase 3+7) ──
+  async function handleOpenInEditor() {
+    if (!identity || !agentProject) return;
+    await openFileInProject(identity.source.file, identity.source.start.line, identity.source.start.column);
+  }
+
+  async function openFileInProject(file: string, line: number, column: number) {
+    if (!agentProject) {
+      flash("Local agent unreachable — run devbridge start", "err");
+      return;
+    }
+    setBusy(true);
+    try {
+      await openInEditor({ projectId: agentProject.id, file, line, column });
+      flash(`Opened ${file}:${line} in VS Code`, "ok");
+    } catch (e: any) {
+      flash(e.message, "err");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // ── Source -> browser (Phase 4): all live instances of this file ──
+  const [locateState, setLocateState] = useState<
+    | { status: "idle" }
+    | { status: "searching" }
+    | { status: "done"; total: number; matches: RuntimeMatch[] }
+  >({ status: "idle" });
+
+  async function handleLocateFile() {
+    if (!identity || !agentProject) return;
+    setLocateState({ status: "searching" });
+    try {
+      const list = await getIdentities(fetch, identity.source.file);
+      const devIds = [...new Set(list.map((i) => i.id))].slice(0, 200);
+      if (devIds.length === 0) {
+        setLocateState({ status: "done", total: 0, matches: [] });
+        return;
+      }
+      const matches = await locateDevIds(devIds);
+      const total = matches.reduce((n, m) => n + m.instances, 0);
+      setLocateState({ status: "done", total, matches });
+      if (total === 0) {
+        flash("No live instances of this file — is the route or component mounted?", "warn");
+      }
+    } catch (e: any) {
+      setLocateState({ status: "idle" });
+      flash(e.message, "err");
+    }
+  }
+
+  async function countVisibleInstances(devIds: string[]) {
+    if (devIds.length === 0) return;
+    try {
+      await locateDevIds(devIds.slice(0, 200));
+    } catch (e: any) {
+      flash(e.message, "err");
+    }
+  }
+
+  function viewIdentitiesForFile(file: string) {
+    setComponentsFileFilter(file);
+    setNav("components");
+  }
+
   // ─────────────────────────────────────────────────────────────
   // RENDER
   // ─────────────────────────────────────────────────────────────
@@ -573,224 +793,373 @@ export function App() {
   // empty state — otherwise the warning flash has nowhere to render.
   const hasSelection = devId !== null || selectedTag !== null;
 
-  if (!hasSelection) {
-    return (
-      <div style={S.empty}>
-        <div style={{ fontSize: 36 }}>🔍</div>
-        <button
-          style={{ ...S.primaryBtn, opacity: connected ? 1 : 0.5 }}
-          onClick={() => toggleInspect(!inspecting)}
-          disabled={!connected}
-          aria-label={inspecting ? "Stop inspecting" : "Start inspecting"}
-          title={inspecting ? "Stop inspecting (or press Escape on the page)" : "Hover an element on the page and click it"}
-        >
-          {inspecting ? "Stop inspecting" : "Start inspecting"}
-        </button>
-        <p style={{ color: C.muted, fontSize: 12, textAlign: "center" }}>
-          {inspecting
-            ? "Click any highlighted element on the page — or press Escape to cancel."
-            : "Hover an element on the page and click it to open it in DevBridge."}
-        </p>
-        {!connected && (
-          <p style={{ color: "#fca5a5", fontSize: 11, textAlign: "center", maxWidth: 320 }}>
-            Not connected to the background worker yet — reloading the DevBridge tab usually fixes it.
-          </p>
-        )}
-      </div>
+  const connStrip = (() => {
+    const dot = (color: string) => (
+      <span style={{ ...S.statusDot, background: color }} aria-hidden="true" />
     );
-  }
+    switch (connection.kind) {
+      case "connected":
+        return (
+          <div style={S.connStrip}>
+            {dot(C.green)}
+            <span>
+              {pageInfo!.identityCount} identities on page
+              {liveStatus === "live" ? " · live" : liveStatus === "offline" ? " · state stream offline" : ""}
+            </span>
+          </div>
+        );
+      case "no-agent":
+        return <div style={S.connStrip}>{dot(C.red)}<span>Local agent unreachable — run `devbridge start`, then Refresh.</span></div>;
+      case "unknown-page":
+        return <div style={S.connStrip}>{dot(C.dim)}<span>Waiting for page info — open the inspected tab on the dev server…</span></div>;
+      case "uninstrumented":
+        return <div style={S.connStrip}>{dot(C.dim)}<span>This page is not connected to a DevBridge development project.</span></div>;
+      case "mismatch":
+        return (
+          <div style={S.connStrip}>
+            {dot(C.amber)}
+            <span>
+              Page ({connection.actual || "unknown origin"}) doesn&apos;t match dev server ({connection.expected}). Source operations disabled.
+            </span>
+          </div>
+        );
+    }
+  })();
+
+  const canUseSource = connection.kind === "connected" && !!identity;
+
+  const frameworkOf = identity?.framework ?? agentProject?.framework ?? null;
+  const lineCol = identity
+    ? `${identity.source.file}:${identity.source.start.line}:${identity.source.start.column + 1}`
+    : "no source mapping";
 
   return (
     <div style={S.root}>
+      <NavRail active={nav} onNavigate={(v) => { setNav(v); if (v !== "components") setComponentsFileFilter(null); }} />
+      <div style={S.main}>
+        <Header
+          connection={connection}
+          agentProject={agentProject}
+          agentReachable={agentReachable}
+          pageInfo={pageInfo}
+          onRefresh={refreshConnection}
+          onOpenSettings={() => setNav("settings")}
+        />
+        {connStrip}
 
-      {/* ── Top bar ── */}
-      <div style={S.topBar}>
-        <div style={S.componentName}>
-          <span style={{ color: C.purple }}>⬡</span>{" "}
-          {identity?.component ?? (devId ?? (selectedTag ? `<${selectedTag}> (no identity)` : "unknown"))}
-        </div>
-        <div style={S.filePill} title={identity?.source.file ?? "No source mapping for this element"}>
-          {identity ? `${identity.source.file}:${identity.source.start.line}` : "no source"}
-        </div>
-        {liveTag && <span style={S.liveBadge}>LIVE</span>}
-        <button
-          style={{ ...S.ghostBtn, borderColor: inspecting ? C.purple : C.border }}
-          onClick={() => toggleInspect(!inspecting)}
-          title={inspecting ? "Stop inspecting (or press Escape on the page)" : "Inspect another element"}
-          aria-label={inspecting ? "Stop inspecting" : "Inspect another element"}
-        >
-          {inspecting ? "■" : "🔍"}
-        </button>
-        <button
-          style={S.ghostBtn}
-          onClick={() => devId && locateElement(devId)}
-          title={devId ? "Scroll to and flash this element in the page" : "No element to locate"}
-          aria-label="Locate element in page"
-          disabled={!devId}
-        >
-          🎯
-        </button>
-        <button
-          style={S.ghostBtn}
-          onClick={() => { setDevId(null); setSelectedTag(null); toggleInspect(false); }}
-          title="Clear selection"
-          aria-label="Clear selection"
-        >
-          ✕
-        </button>
-      </div>
-
-      {/* ── Flash message ── */}
-      {flashMsg && (
-        <div style={{ ...S.flash, background: flashMsg.kind === "ok" ? "#14532d" : flashMsg.kind === "err" ? "#7f1d1d" : "#713f12" }}>
-          {flashMsg.text}
-        </div>
-      )}
-
-      {/* ── Tab strip ── */}
-      <div style={S.tabStrip}>
-        {(["editor","diff","applied"] as View[]).map(v => (
-          <button
-            key={v}
-            style={{ ...S.tab, ...(view === v ? S.tabActive : {}) }}
-            onClick={() => setView(v)}
-            disabled={v === "diff" && !patch || v === "applied" && !checkpoint}
-          >
-            {v === "editor" ? "✏️ Edit" : v === "diff" ? "🔀 Diff" : "✅ Applied"}
-          </button>
-        ))}
-      </div>
-
-      {/* ══════════════ EDITOR VIEW ══════════════ */}
-      {view === "editor" && (
-        <div style={S.editorWrapper}>
-          {!devId ? (
-            <div style={S.monacoPlaceholder}>
-              No DevBridge identity for this element.<br />
-              <span style={{ fontSize: 11, color: C.muted }}>
-                {selectedTag ? `<${selectedTag}> carries no data-dev-id, so there is no component or source file to show. ` : ""}
-                Select an instrumented element, or press 🔍 to inspect again.
-              </span>
-            </div>
-          ) : window.monaco ? (
-            <div ref={monacoContainerRef} style={S.monacoContainer} />
-          ) : (
-            <div style={S.monacoPlaceholder}>
-              Loading Monaco…<br />
-              <span style={{ fontSize: 11, color: C.muted }}>
-                Make sure panel.html includes the Monaco CDN loader script.
-              </span>
-            </div>
-          )}
-          <div style={S.editorFooter}>
-            <RiskBadge patch={patch} />
-            <div style={{ flex: 1 }} />
-            <button
-              style={{ ...S.primaryBtn, opacity: busy ? 0.6 : 1 }}
-              onClick={handleCreatePatch}
-              disabled={busy || !source}
-            >
-              {busy ? "…" : "Preview diff →"}
-            </button>
-          </div>
-        </div>
-      )}
-
-      {/* ══════════════ DIFF VIEW ══════════════ */}
-      {view === "diff" && patch && (
-        <div style={S.diffWrapper}>
-          {/* Risk banner */}
-          <RiskBanner patch={patch} />
-
-          {/* Side-by-side Monaco diff */}
-          <div ref={diffContainerRef} style={S.monacoContainer} />
-
-          {/* Raw unified diff (collapsible) */}
-          <details style={S.rawDiffDetails}>
-            <summary style={{ cursor: "pointer", color: C.muted, fontSize: 11, padding: "6px 12px" }}>
-              Raw unified diff
-            </summary>
-            <pre style={S.rawDiff}>{patch.diff}</pre>
-          </details>
-
-          {/* Action bar */}
-          <div style={S.actionBar}>
-            <button style={{ ...S.dangerBtn, opacity: busy ? 0.6 : 1 }} onClick={handleReject} disabled={busy}>
-              ✕ Reject
-            </button>
-            <button
-              style={{ ...S.primaryBtn, opacity: busy ? 0.6 : 1 }}
-              onClick={handleApprove}
-              disabled={busy}
-            >
-              {busy ? "Applying…" : "✓ Approve & Apply"}
-            </button>
-          </div>
-        </div>
-      )}
-
-      {/* ══════════════ APPLIED VIEW ══════════════ */}
-      {view === "applied" && patch && (
-        <div style={{ padding: 16 }}>
-          <div style={S.appliedBanner}>
-            <div style={{ fontSize: 28 }}>✅</div>
-            <div>
-              <div style={{ fontWeight: 700, marginBottom: 4 }}>Patch applied</div>
-              <div style={{ color: C.muted, fontSize: 12 }}>{patch.file} written to disk</div>
-            </div>
-          </div>
-
-          {checkpoint && (
-            <div style={S.checkpointCard}>
-              <div style={{ color: C.muted, fontSize: 11, marginBottom: 6 }}>Git checkpoint</div>
-              <div style={{ fontFamily: "monospace", fontSize: 12 }}>{checkpoint.sha.slice(0, 7)} — {checkpoint.message}</div>
-              <div style={{ color: C.muted, fontSize: 11, marginTop: 4 }}>{new Date(checkpoint.timestamp).toLocaleTimeString()}</div>
-              <button
-                style={{ ...S.dangerBtn, marginTop: 12, opacity: busy ? 0.6 : 1 }}
-                onClick={handleRollback}
-                disabled={busy}
-              >
-                {busy ? "Rolling back…" : "↩ Rollback this commit"}
-              </button>
-            </div>
-          )}
-
-          <button
-            style={{ ...S.ghostBtn, marginTop: 16, display: "block", width: "100%" }}
-            onClick={() => { setView("editor"); setPatch(null); setCheckpoint(null); }}
-          >
-            ← Back to editor
-          </button>
-        </div>
-      )}
-
-      {/* ══════════════ PROPS / STATE ══════════════ */}
-      <div style={S.stateSection}>
-        <div style={S.sectionHeader}>
-          PROPS & STATE
-          {liveTag && <span style={S.liveBadge}>LIVE</span>}
-          {liveStatus === "offline" && (
-            <span style={{ ...S.liveBadge, background: "#713f12" }} title="Local agent unreachable — retrying">
-              OFFLINE
-            </span>
-          )}
-        </div>
-        {snapshot ? (
-          <>
-            <SnapshotTable label="Props"   data={snapshot.props}   color="#38bdf8" />
-            <SnapshotTable label="State"   data={snapshot.state}   color="#a78bfa" />
-            <SnapshotTable label="Context" data={snapshot.context} color="#34d399" />
-            <div style={{ color: C.dim, fontSize: 10, marginTop: 4 }}>
-              updated {new Date(snapshot.timestamp).toLocaleTimeString()}
-            </div>
-          </>
-        ) : (
-          <div style={{ color: C.muted, fontSize: 11 }}>
-            Waiting for component to call <code style={S.ic}>reportState()</code>…
+        {/* ── Flash message ── */}
+        {flashMsg && (
+          <div style={{ ...S.notice, borderLeft: `2px solid ${flashMsg.kind === "ok" ? C.accent : flashMsg.kind === "err" ? C.red : C.amber}` }}>
+            {flashMsg.text}
           </div>
         )}
-      </div>
 
+        {/* Inspect view stays mounted (display:none) when another nav view
+            is active so Monaco's DOM survives the switch. */}
+        <div style={{ display: nav === "inspect" ? "contents" : "none" }} aria-hidden={nav !== "inspect"}>
+          {!hasSelection ? (
+            <InspectLanding
+              inspecting={inspecting}
+              connected={connected}
+              invalidated={invalidated}
+              onToggleInspect={() => toggleInspect(!inspecting)}
+            />
+          ) : (
+            <div style={{ ...S.listView }}>
+              {/* ── Selection workspace header ── */}
+              <div style={S.selBar}>
+                <div style={S.selMeta}>
+                  <div style={S.componentName}>
+                    {identity?.component ?? (devId ?? (selectedTag ? `<${selectedTag}> (no identity)` : "unknown"))}
+                    {frameworkOf && <span style={{ fontWeight: 400, color: C.muted }}> · {frameworkOf}</span>}
+                    {liveTag && <span style={{ ...S.ic, marginLeft: 8 }}>live</span>}
+                  </div>
+                  <div style={S.filePath} title={identity?.source.file ?? "No source mapping for this element"}>
+                    {lineCol}
+                  </div>
+                </div>
+                <div style={S.actionsRow}>
+                  <button
+                    className="db-btn"
+                    style={S.btn}
+                    onClick={() => toggleInspect(!inspecting)}
+                    title={inspecting ? "Stop inspecting (or press Escape on the page)" : "Inspect another element"}
+                    aria-label={inspecting ? "Stop inspecting" : "Inspect another element"}
+                  >
+                    {inspecting ? "Stop" : "Inspect"}
+                  </button>
+                  <button
+                    className="db-btn"
+                    style={S.btn}
+                    onClick={() => devId && locateElement(devId)}
+                    title={devId ? "Scroll to and highlight this element in the page" : "No element to locate"}
+                    aria-label="Highlight element in page"
+                    disabled={!devId}
+                  >
+                    Highlight
+                  </button>
+                  <button
+                    className="db-btn db-btn-cyan"
+                    style={{ ...S.btn, ...S.btnCyan, opacity: canUseSource && !busy ? 1 : 0.5 }}
+                    onClick={() => void handleLocateFile()}
+                    title={canUseSource ? "Find every live instance rendered from this file" : "Available on a connected project"}
+                    aria-label="Locate instances in browser"
+                    disabled={!canUseSource || locateState.status === "searching"}
+                  >
+                    {locateState.status === "searching" ? "Locating…" : "Locate"}
+                  </button>
+                  <button
+                    className="db-btn db-btn-cyan"
+                    style={{ ...S.btn, ...S.btnCyan, opacity: canUseSource && !busy ? 1 : 0.5 }}
+                    onClick={() => void handleOpenInEditor()}
+                    title={canUseSource ? `Open ${identity!.source.file}:${identity!.source.start.line} in VS Code` : "Select an instrumented element on a connected project to open it in VS Code"}
+                    aria-label="Open source in VS Code"
+                    disabled={!canUseSource || busy}
+                  >
+                    Open in VS Code
+                  </button>
+                  <button
+                    className="db-btn"
+                    style={S.btn}
+                    onClick={() => { resetSelection(null, null); toggleInspect(false); }}
+                    title="Clear selection"
+                    aria-label="Clear selection"
+                  >
+                    Clear
+                  </button>
+                </div>
+              </div>
+
+              {/* ── Tab strip ── */}
+              <div style={S.tabStrip} role="tablist" aria-label="Source views">
+                {(["editor", "diff", "applied"] as EditorTab[]).map((v) => (
+                  <button
+                    key={v}
+                    role="tab"
+                    aria-selected={view === v}
+                    className="db-tab"
+                    style={{ ...S.tab, ...(view === v ? S.tabActive : {}) }}
+                    onClick={() => setView(v)}
+                    disabled={(v === "diff" && !patch) || (v === "applied" && !checkpoint)}
+                  >
+                    {v === "editor" ? "Edit" : v === "diff" ? "Diff" : "Applied"}
+                  </button>
+                ))}
+              </div>
+
+              {/* ══════════════ EDITOR VIEW ══════════════ */}
+              {view === "editor" && (
+                <div style={S.editorWrapper}>
+                  {!devId ? (
+                    <div style={S.monacoPlaceholder}>
+                      No DevBridge identity for this element.
+                      <span style={{ fontSize: 11, color: C.muted }}>
+                        {selectedTag ? `<${selectedTag}> carries no data-dev-id, so there is no component or source file to show. ` : ""}
+                        Select an instrumented element, or press Inspect to try again.
+                      </span>
+                    </div>
+                  ) : window.monaco ? (
+                    <div ref={monacoContainerRef} style={S.monacoContainer} />
+                  ) : (
+                    <div style={S.monacoPlaceholder}>
+                      Loading editor…
+                      <span style={{ fontSize: 11, color: C.muted }}>
+                        Make sure panel.html includes the Monaco loader script.
+                      </span>
+                    </div>
+                  )}
+                  <div style={S.editorFooter}>
+                    <RiskBadge patch={patch} />
+                    <div style={{ flex: 1 }} />
+                    <button
+                      className="db-btn db-btn-primary"
+                      style={{ ...S.btn, ...S.btnPrimary, opacity: busy ? 0.6 : 1 }}
+                      onClick={() => void handleCreatePatch()}
+                      disabled={busy || !source}
+                    >
+                      {busy ? "Working…" : "Preview diff"}
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {/* ══════════════ DIFF VIEW ══════════════ */}
+              {view === "diff" && patch && (
+                <div style={S.diffWrapper}>
+                  {/* Risk banner */}
+                  <RiskBanner patch={patch} />
+
+                  {/* Side-by-side Monaco diff */}
+                  <div ref={diffContainerRef} style={S.monacoContainer} />
+
+                  {/* Raw unified diff (collapsible) */}
+                  <details style={S.rawDiffDetails}>
+                    <summary className="db-summary" style={{ cursor: "pointer", color: C.muted, fontSize: 11, padding: "6px 12px" }}>
+                      Raw unified diff
+                    </summary>
+                    <pre style={S.rawDiff}>{patch.diff}</pre>
+                  </details>
+
+                  {/* Action bar */}
+                  <div style={S.actionBar}>
+                    <button className="db-btn" style={{ ...S.btn, ...S.btnDanger, opacity: busy ? 0.6 : 1 }} onClick={() => void handleReject()} disabled={busy}>
+                      Reject
+                    </button>
+                    <button
+                      className="db-btn db-btn-primary"
+                      style={{ ...S.btn, ...S.btnPrimary, opacity: busy ? 0.6 : 1 }}
+                      onClick={() => void handleApprove()}
+                      disabled={busy}
+                    >
+                      {busy ? "Applying…" : "Approve and apply"}
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {/* ══════════════ APPLIED VIEW ══════════════ */}
+              {view === "applied" && patch && (
+                <div style={{ padding: 16, overflowY: "auto", flex: "1 1 auto", minHeight: 0 }}>
+                  <div style={{ display: "flex", gap: 10, alignItems: "baseline", marginBottom: 6 }}>
+                    <div style={{ fontWeight: 600 }}>Patch applied</div>
+                    <span style={{ ...S.ic }}>{patch.status}</span>
+                  </div>
+                  <div style={{ color: C.muted, fontSize: 12, fontFamily: MONO_FONT, marginBottom: 12 }}>{patch.file} written to disk</div>
+
+                  {checkpoint && (
+                    <div style={{ borderTop: `1px solid ${C.border}`, paddingTop: 10 }}>
+                      <div style={{ color: C.muted, fontSize: 11, marginBottom: 4 }}>Git checkpoint</div>
+                      <div style={{ fontFamily: MONO_FONT, fontSize: 12 }}>{checkpoint.sha.slice(0, 7)} — {checkpoint.message}</div>
+                      <div style={{ color: C.muted, fontSize: 11, marginTop: 4 }}>{new Date(checkpoint.timestamp).toLocaleTimeString()}</div>
+                      <button
+                        className="db-btn"
+                        style={{ ...S.btn, marginTop: 10, opacity: busy ? 0.6 : 1 }}
+                        onClick={() => void handleRollback()}
+                        disabled={busy}
+                      >
+                        {busy ? "Rolling back…" : "Roll back this commit"}
+                      </button>
+                    </div>
+                  )}
+
+                  <button
+                    className="db-btn"
+                    style={{ ...S.btn, marginTop: 16 }}
+                    onClick={() => { setView("editor"); setPatch(null); setCheckpoint(null); }}
+                  >
+                    Back to editor
+                  </button>
+                </div>
+              )}
+
+              {/* ══════════════ LOWER SECTIONS ══════════════ */}
+              <div style={S.lowerSections}>
+                <details style={S.disclosure} open={locateState.status === "done" && locateState.total > 0}>
+                  <summary className="db-summary" style={S.disclosureSummary}>
+                    Component instances
+                    {locateState.status === "done" && (
+                      <span style={{ fontWeight: 400, textTransform: "none", letterSpacing: 0, marginLeft: 8 }}>
+                        {locateState.total === 0
+                          ? "— 0 live"
+                          : `— ${locateState.total} live`}
+                      </span>
+                    )}
+                  </summary>
+                  <div style={S.disclosureBody}>
+                    {locateState.status === "done" && locateState.total > 0 ? (
+                      <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                        {locateState.matches
+                          .filter((m) => m.instances > 0)
+                          .map((m) => (
+                            <div key={m.devId} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 11 }}>
+                              <code style={S.ic}>{m.devId}</code>
+                              <span style={{ color: C.muted }}>× {m.instances}</span>
+                              <button
+                                className="db-btn"
+                                style={{ ...S.btn, padding: "2px 8px", fontSize: 11 }}
+                                onClick={() => locateElement(m.devId)}
+                                title={`Scroll to an instance of ${m.devId}`}
+                              >
+                                Highlight
+                              </button>
+                            </div>
+                          ))}
+                      </div>
+                    ) : (
+                      <div style={{ color: C.muted, fontSize: 11 }}>
+                        {locateState.status === "searching"
+                          ? "Searching the page…"
+                          : "Press Locate above to count live instances of this file."}
+                      </div>
+                    )}
+                  </div>
+                </details>
+
+                <details style={{ ...S.disclosure, borderBottom: "none" }} open>
+                  <summary className="db-summary" style={S.disclosureSummary}>
+                    Props &amp; state
+                    {liveTag && <span style={{ ...S.ic, marginLeft: 8 }}>live</span>}
+                    {liveStatus === "offline" && (
+                      <span style={{ ...S.ic, marginLeft: 8 }} title="Local agent unreachable — retrying">
+                        offline
+                      </span>
+                    )}
+                  </summary>
+                  <div style={S.disclosureBody}>
+                    {snapshot ? (
+                      <>
+                        <SnapshotTable label="Props"   data={snapshot.props} />
+                        <SnapshotTable label="State"   data={snapshot.state} />
+                        <SnapshotTable label="Context" data={snapshot.context} />
+                        <div style={{ color: C.dim, fontSize: 10, marginTop: 4 }}>
+                          updated {new Date(snapshot.timestamp).toLocaleTimeString()}
+                        </div>
+                      </>
+                    ) : (
+                      <div style={{ color: C.muted, fontSize: 11 }}>
+                        Waiting for component to call <code style={S.ic}>reportState()</code>…
+                      </div>
+                    )}
+                  </div>
+                </details>
+              </div>
+            </div>
+          )}
+        </div>
+
+        {nav === "components" && (
+          <ComponentsView
+            agentReachable={agentReachable}
+            selectedDevId={devId}
+            instanceCounts={instanceCounts}
+            onSelect={selectComponent}
+            onHighlight={locateElement}
+            onCountVisible={(ids) => void countVisibleInstances(ids)}
+            initialFileFilter={componentsFileFilter}
+          />
+        )}
+
+        {nav === "files" && (
+          <FilesView
+            agentReachable={agentReachable && connection.kind === "connected"}
+            onOpenFile={(file, line, column) => void openFileInProject(file, line, column)}
+            onViewIdentities={viewIdentitiesForFile}
+          />
+        )}
+
+        {nav === "settings" && (
+          <SettingsView
+            connection={connection}
+            agentProject={agentProject}
+            agentReachable={agentReachable}
+            pageInfo={pageInfo}
+            liveStatus={liveStatus}
+            prefs={prefs}
+            onPrefsChange={updatePrefs}
+            onRefresh={refreshConnection}
+          />
+        )}
+      </div>
     </div>
   );
 }
@@ -801,38 +1170,37 @@ export function App() {
 
 function RiskBadge({ patch }: { patch: SourcePatch | null }) {
   if (!patch) return null;
-  const colors: Record<string, string> = { low: "#22c55e", medium: "#eab308", high: "#ef4444" };
   return (
-    <span style={{ fontSize: 11, fontWeight: 700, color: colors[patch.risk], fontFamily: "monospace" }}>
-      {patch.risk.toUpperCase()} RISK
+    <span style={{ fontSize: 11, color: C.muted, fontFamily: MONO_FONT }}>
+      risk: {patch.risk}
     </span>
   );
 }
 
 function RiskBanner({ patch }: { patch: SourcePatch }) {
-  const bg: Record<string, string> = { low: "#14532d", medium: "#713f12", high: "#7f1d1d" };
+  const edge: Record<string, string> = { low: C.accent, medium: C.amber, high: C.red };
   return (
-    <div style={{ background: bg[patch.risk], padding: "8px 14px", fontSize: 12 }}>
-      <span style={{ fontWeight: 700, marginRight: 8 }}>
-        {patch.risk === "low" ? "✅" : patch.risk === "medium" ? "⚠️" : "🔴"} {patch.risk.toUpperCase()} RISK
+    <div style={{ borderLeft: `2px solid ${edge[patch.risk] ?? C.border}`, padding: "6px 12px", fontSize: 12, background: C.bg2, color: C.text }}>
+      <span style={{ fontWeight: 600, marginRight: 8 }}>
+        {patch.risk} risk
       </span>
-      {patch.riskReasons.join(" · ")}
+      <span style={{ color: C.muted }}>{patch.riskReasons.join(" · ")}</span>
     </div>
   );
 }
 
-function SnapshotTable({ label, data, color }: { label: string; data: Record<string,unknown>; color: string }) {
+function SnapshotTable({ label, data }: { label: string; data: Record<string, unknown> }) {
   const entries = Object.entries(data);
   if (!entries.length) return null;
   return (
     <div style={{ marginBottom: 8 }}>
-      <div style={{ color, fontWeight: 700, fontSize: 10, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: 3 }}>{label}</div>
+      <div style={{ color: C.muted, fontWeight: 600, fontSize: 10, textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 3 }}>{label}</div>
       <table style={{ width: "100%", borderCollapse: "collapse" }}>
         <tbody>
           {entries.map(([k, v]) => (
             <tr key={k}>
-              <td style={{ color: C.muted, paddingRight: 10, fontSize: 11, whiteSpace: "nowrap", verticalAlign: "top", paddingBottom: 2 }}>{k}</td>
-              <td style={{ color: C.text, fontSize: 11, wordBreak: "break-all", paddingBottom: 2 }}>{fmt(v)}</td>
+              <td style={{ color: C.muted, paddingRight: 10, fontSize: 11, whiteSpace: "nowrap", verticalAlign: "top", paddingBottom: 2, fontFamily: MONO_FONT }}>{k}</td>
+              <td style={{ color: C.text, fontSize: 11, wordBreak: "break-all", paddingBottom: 2, fontFamily: MONO_FONT }}>{fmt(v)}</td>
             </tr>
           ))}
         </tbody>
@@ -862,56 +1230,3 @@ function fmt(v: unknown): string {
   if (typeof v === "object") return JSON.stringify(v);
   return String(v);
 }
-
-// ─────────────────────────────────────────────────────────────
-// Design tokens
-// ─────────────────────────────────────────────────────────────
-
-const C = {
-  bg:     "#0f172a",
-  bg2:    "#1e293b",
-  bg3:    "#273047",
-  border: "#1e293b",
-  purple: "#7c3aed",
-  purpleL:"#a78bfa",
-  text:   "#e2e8f0",
-  muted:  "#94a3b8",
-  dim:    "#475569",
-};
-
-const S: Record<string, React.CSSProperties> = {
-  root:    { display: "flex", flexDirection: "column", height: "100vh", background: C.bg, color: C.text, fontFamily: "monospace", fontSize: 12, overflow: "hidden" },
-  empty:   { display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 16, height: "100vh", padding: 24 },
-
-  topBar:  { display: "flex", alignItems: "center", gap: 8, padding: "8px 12px", borderBottom: `1px solid ${C.border}`, background: C.bg2, flexShrink: 0 },
-  componentName: { fontWeight: 700, color: C.purpleL, flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
-  filePill:{ background: C.bg3, border: `1px solid ${C.border}`, borderRadius: 4, padding: "2px 7px", fontSize: 10, color: C.muted, whiteSpace: "nowrap" },
-
-  tabStrip:{ display: "flex", borderBottom: `1px solid ${C.border}`, background: C.bg2, flexShrink: 0 },
-  tab:     { flex: 1, padding: "7px 4px", border: "none", borderBottom: "2px solid transparent", background: "transparent", color: C.muted, cursor: "pointer", fontSize: 11, fontFamily: "monospace" },
-  tabActive:{ color: C.purpleL, borderBottomColor: C.purple, background: C.bg },
-
-  editorWrapper: { display: "flex", flexDirection: "column", flex: 1, overflow: "hidden" },
-  monacoContainer: { flex: 1, minHeight: 0 },
-  monacoPlaceholder: { flex: 1, display: "flex", alignItems: "center", justifyContent: "center", flexDirection: "column", gap: 8, color: C.muted, fontSize: 13 },
-  editorFooter: { display: "flex", alignItems: "center", padding: "8px 12px", borderTop: `1px solid ${C.border}`, background: C.bg2, gap: 8, flexShrink: 0 },
-
-  diffWrapper: { display: "flex", flexDirection: "column", flex: 1, overflow: "hidden" },
-  rawDiffDetails: { background: C.bg, borderTop: `1px solid ${C.border}`, flexShrink: 0 },
-  rawDiff: { padding: 12, overflowX: "auto", fontSize: 11, color: C.muted, lineHeight: 1.6, maxHeight: 160, overflowY: "auto" },
-  actionBar: { display: "flex", gap: 8, padding: "10px 12px", borderTop: `1px solid ${C.border}`, background: C.bg2, justifyContent: "flex-end", flexShrink: 0 },
-
-  appliedBanner: { display: "flex", gap: 12, alignItems: "center", background: "#14532d", borderRadius: 8, padding: 14, marginBottom: 14 },
-  checkpointCard: { background: C.bg2, border: `1px solid ${C.border}`, borderRadius: 8, padding: 14 },
-
-  stateSection: { borderTop: `1px solid ${C.border}`, padding: "10px 12px", flexShrink: 0, maxHeight: 220, overflowY: "auto" },
-  sectionHeader: { display: "flex", alignItems: "center", gap: 8, fontWeight: 700, color: C.purple, fontSize: 10, textTransform: "uppercase" as const, letterSpacing: "0.06em", marginBottom: 8 },
-
-  flash: { padding: "7px 14px", fontSize: 12, flexShrink: 0 },
-  liveBadge: { background: "#22c55e", color: "#fff", fontSize: 9, fontWeight: 700, padding: "1px 5px", borderRadius: 3, letterSpacing: "0.05em" },
-
-  primaryBtn: { background: C.purple, color: "#fff", border: "none", borderRadius: 6, padding: "7px 16px", cursor: "pointer", fontSize: 12, fontFamily: "monospace", fontWeight: 600 },
-  dangerBtn:  { background: "#7f1d1d", color: "#fca5a5", border: "none", borderRadius: 6, padding: "7px 16px", cursor: "pointer", fontSize: 12, fontFamily: "monospace" },
-  ghostBtn:   { background: "transparent", color: C.muted, border: `1px solid ${C.border}`, borderRadius: 6, padding: "6px 12px", cursor: "pointer", fontSize: 12, fontFamily: "monospace" },
-  ic:         { background: C.bg3, padding: "1px 4px", borderRadius: 3, color: C.purpleL },
-};

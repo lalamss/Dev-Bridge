@@ -87,6 +87,22 @@ export function devbridgePlugin(options: DevBridgeViteOptions = {}): Plugin {
     }
   }
 
+  async function reportDevServer(url: string) {
+    // Best-effort like pushIdentities: the agent may not be running, and the
+    // app must work regardless. The agent only accepts this from non-browser
+    // callers (POSTs with an Origin header are 403), so a webpage can never
+    // claim to be this project.
+    try {
+      await fetch(`${agentUrl}/project/dev-server`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ url }),
+      });
+    } catch {
+      // Agent not running — identities simply won't resolve to a project yet.
+    }
+  }
+
   return {
     name: "devbridge:vite-plugin",
     enforce: "pre",
@@ -94,6 +110,20 @@ export function devbridgePlugin(options: DevBridgeViteOptions = {}): Plugin {
     configResolved(config) {
       isDev = config.command === "serve";
       projectRoot = config.root ?? process.cwd();
+    },
+
+    configureServer(server) {
+      // Phase 5 (project detection): tell the agent which origin serves this
+      // instrumented app, so the panel can match an inspected page to this
+      // project instead of a bare "localhost:<port>". configureServer only
+      // runs for `vite serve`, matching the plugin's dev-only activation.
+      const httpServer = server.httpServer;
+      if (!httpServer) return;
+      httpServer.once("listening", () => {
+        const addr = httpServer.address();
+        const port = typeof addr === "object" && addr ? addr.port : server.config.server.port ?? 5173;
+        void reportDevServer(`http://127.0.0.1:${port}`);
+      });
     },
 
     transform(code, id) {
