@@ -104,8 +104,8 @@ export function FilesView({ agentReachable, onOpenFile, onViewIdentities }: File
           <button
             key={f}
             role="listitem"
-            className="db-row"
-            style={{ ...S.row, ...(f === selected ? S.rowActive : {}) }}
+            className={`db-row${f === selected ? " db-row-active" : ""}`}
+            style={S.row}
             onClick={() => void handleSelect(f)}
             title={f}
             aria-label={`Preview ${f}`}
@@ -124,7 +124,7 @@ export function FilesView({ agentReachable, onOpenFile, onViewIdentities }: File
           <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6, whiteSpace: "normal" }}>
             <span style={{ ...S.ic }}>{selected}</span>
             <button
-              className="db-btn"
+              className="db-btn db-btn-cyan"
               style={{ ...S.btn, ...S.btnCyan, fontSize: 11, padding: "2px 8px" }}
               onClick={() => onOpenFile(selected, 1, 0)}
               title={`Open ${selected} in VS Code`}

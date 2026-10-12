@@ -2,6 +2,9 @@ import { describe, expect, it } from "vitest";
 import { C, S } from "../theme";
 import {
   WELCOME_CTA_LABEL,
+  WELCOME_DESCRIPTION,
+  WELCOME_HEADLINE,
+  WELCOME_HELPER_CAPTION,
   WELCOME_STOP_LABEL,
   WELCOME_TAGLINE,
   WELCOME_WORDMARK_BRIDGE,
@@ -35,6 +38,14 @@ describe("welcome copy", () => {
     expect(WELCOME_STOP_LABEL).toBe("Stop inspecting");
     expect(inspectingCtaLabel(false)).toBe("Inspect a page");
     expect(inspectingCtaLabel(true)).toBe("Stop inspecting");
+  });
+
+  it("uses the polished headline, supporting text, and helper caption", () => {
+    expect(WELCOME_HEADLINE).toBe("Your browser. Your code. Connected.");
+    expect(WELCOME_DESCRIPTION).toBe(
+      "Select any element to jump to its source and inspect live component instances.",
+    );
+    expect(WELCOME_HELPER_CAPTION).toBe("Select an element to get started.");
   });
 });
 
@@ -100,10 +111,30 @@ describe("welcome centering + responsive composition", () => {
   });
 
   it("uses Arial for the wordmark and welcome text", () => {
-    for (const key of ["welcomeWordmark", "welcomeTagline", "welcomeCta", "welcomeHint"] as const) {
+    for (const key of [
+      "welcomeWordmark",
+      "welcomeTagline",
+      "welcomeHeadline",
+      "welcomeDescription",
+      "welcomeCaption",
+      "welcomeCta",
+      "welcomeHint",
+    ] as const) {
       const style = S[key] as { fontFamily?: string };
       expect(String(style.fontFamily ?? "")).toMatch(/arial/i);
     }
+  });
+
+  it("keeps the headline, description, and caption readable and consistently spaced", () => {
+    const headline = S.welcomeHeadline as { color?: string; marginTop?: number; fontSize?: string };
+    expect(String(headline.color ?? "").toLowerCase()).toBe("#f3f4f6");
+    expect(String(headline.fontSize ?? "")).toContain("clamp");
+    const description = S.welcomeDescription as { color?: string; marginTop?: number };
+    expect(String(description.color ?? "").toLowerCase()).toBe("#9aa0ae");
+    const caption = S.welcomeCaption as { marginTop?: number };
+    expect(caption.marginTop).toBeGreaterThanOrEqual(8);
+    const cta = S.welcomeCta as { marginTop?: number };
+    expect(cta.marginTop).toBeGreaterThanOrEqual(20);
   });
 
   it("renders Dev in off-white and Bridge in a violet-to-blue accent", () => {

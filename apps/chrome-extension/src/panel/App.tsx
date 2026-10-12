@@ -25,15 +25,20 @@ import {
   getSource,
   getStateSnapshot,
   getProject,
+  getVSCodeStatus,
   openInEditor,
+  openVSCodeDownloadPage,
   previewPatch,
   rejectPatch,
   rollbackCheckpoint,
+  VSCodeNotDetectedError,
 } from "./api";
 import type { EditorTab, PanelView } from "./navigation";
+import { normalizeLoopbackOrigin } from "./navigation";
 import { chromeLocalPrefsStore, DEFAULT_PREFERENCES, type PanelPreferences } from "./preferences";
 import { Header } from "./components/Header";
 import { NavRail } from "./components/NavRail";
+import { VSCodeDialog, type VSCodeDialogStage } from "./components/VSCodeDialog";
 import { InspectLanding } from "./views/InspectLanding";
 import { ComponentsView } from "./views/ComponentsView";
 import { FilesView } from "./views/FilesView";
@@ -167,6 +172,8 @@ export function App() {
   // Navigation
   const [nav, setNav] = useState<PanelView>("inspect");
   const [componentsFileFilter, setComponentsFileFilter] = useState<string | null>(null);
+  // Incremented by Refresh so status views refetch instead of reusing mount-time data.
+  const [refreshTick, setRefreshTick] = useState(0);
 
   // Preferences (persisted via chrome.storage.local w/ memory fallback)
   const [prefs, setPrefs] = useState<PanelPreferences>(DEFAULT_PREFERENCES);
@@ -236,6 +243,9 @@ export function App() {
   }, [fetchProject]);
 
   function refreshConnection() {
+    // Bumped on every manual refresh so status views (Settings) refetch fresh
+    // agent state instead of showing values cached from mount time.
+    setRefreshTick((t) => t + 1);
     void fetchProject();
     send({ type: "devbridge:get-page-info" });
   }
@@ -712,7 +722,9 @@ export function App() {
       } catch {
         expected = agentProject.devServerUrl;
       }
-      if (pageInfo.origin !== expected) {
+      // Loopback aliases (localhost vs 127.0.0.1) are the same dev server —
+      // compare canonical forms so opening either host is not a "mismatch".
+      if (normalizeLoopbackOrigin(pageInfo.origin) !== normalizeLoopbackOrigin(expected)) {
         return { kind: "mismatch", expected, actual: pageInfo.origin };
       }
     }
@@ -720,6 +732,18 @@ export function App() {
   })();
 
   // ── Browser -> source -> VS Code (Phase 3+7) ──
+  // The open flow is a small state machine so a missing installation shows
+  // the install dialog (Download / Check again / Cancel) instead of a raw
+  // PATH error, and a successful re-check offers to continue the original
+  // open. FilesView funnels through the same openFileInProject entry point.
+  type VSCodeFlow =
+    | { stage: "idle" }
+    | { stage: "working"; mode: "launching" | "checking"; file: string; line: number; column: number }
+    | { stage: "not-found"; file: string; line: number; column: number; detail: string }
+    | { stage: "found"; file: string; line: number; column: number; via?: string }
+    | { stage: "failed"; file: string; line: number; column: number; detail: string };
+  const [vscodeFlow, setVscodeFlow] = useState<VSCodeFlow>({ stage: "idle" });
+
   async function handleOpenInEditor() {
     if (!identity || !agentProject) return;
     await openFileInProject(identity.source.file, identity.source.start.line, identity.source.start.column);
@@ -730,15 +754,83 @@ export function App() {
       flash("Local agent unreachable — run devbridge start", "err");
       return;
     }
+    setVscodeFlow({ stage: "working", mode: "launching", file, line, column });
     setBusy(true);
     try {
+      // The OS launch is only reported after the agent confirms it started —
+      // no fake success is ever shown.
       await openInEditor({ projectId: agentProject.id, file, line, column });
+      setVscodeFlow({ stage: "idle" });
       flash(`Opened ${file}:${line} in VS Code`, "ok");
     } catch (e: any) {
-      flash(e.message, "err");
+      if (e instanceof VSCodeNotDetectedError) {
+        setVscodeFlow({ stage: "not-found", file, line, column, detail: e.message });
+      } else {
+        setVscodeFlow({ stage: "idle" });
+        flash(e.message, "err");
+      }
     } finally {
       setBusy(false);
     }
+  }
+
+  function closeVSCodeFlow() {
+    setVscodeFlow({ stage: "idle" });
+  }
+
+  async function handleVSCodeCheckAgain() {
+    if (vscodeFlow.stage !== "not-found" && vscodeFlow.stage !== "failed") return;
+    const { file, line, column } = vscodeFlow;
+    setVscodeFlow({ stage: "working", mode: "checking", file, line, column });
+    try {
+      // Forced refresh: finds a VS Code installed after the agent started,
+      // even though the agent's own PATH never changed.
+      const status = await getVSCodeStatus(true);
+      if (status.found) {
+        setVscodeFlow({ stage: "found", file, line, column, via: status.via });
+      } else {
+        setVscodeFlow({
+          stage: vscodeFlow.stage === "failed" ? "failed" : "not-found",
+          file, line, column,
+          detail: status.error ?? "VS Code is still not detected.",
+        });
+      }
+    } catch (e: any) {
+      setVscodeFlow({ stage: "failed", file, line, column, detail: e.message ?? "Detection failed." });
+    }
+  }
+
+  async function handleVSCodeContinue() {
+    if (vscodeFlow.stage !== "found") return;
+    const { file, line, column } = vscodeFlow;
+    if (!agentProject) {
+      flash("Local agent unreachable — run devbridge start", "err");
+      return;
+    }
+    // Continue keeps the dialog open: a launch failure lands on the dialog's
+    // failed stage (with Check again) instead of dismissing to a flash, so
+    // the pending file:line:column is preserved for the retry.
+    setVscodeFlow({ stage: "working", mode: "launching", file, line, column });
+    setBusy(true);
+    try {
+      await openInEditor({ projectId: agentProject.id, file, line, column });
+      setVscodeFlow({ stage: "idle" });
+      flash(`Opened ${file}:${line} in VS Code`, "ok");
+    } catch (e: any) {
+      if (e instanceof VSCodeNotDetectedError) {
+        setVscodeFlow({ stage: "not-found", file, line, column, detail: e.message });
+      } else {
+        setVscodeFlow({ stage: "failed", file, line, column, detail: e.message ?? "Launch failed." });
+      }
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function vscodeDialogStage(): VSCodeDialogStage | null {
+    if (vscodeFlow.stage === "idle") return null;
+    if (vscodeFlow.stage === "working") return vscodeFlow.mode === "checking" ? "checking" : "launching";
+    return vscodeFlow.stage;
   }
 
   // ── Source -> browser (Phase 4): all live instances of this file ──
@@ -854,6 +946,24 @@ export function App() {
           </div>
         )}
 
+        {/* ── VS Code install dialog (missing installation / retry / continue) ── */}
+        {(() => {
+          const dialogStage = vscodeDialogStage();
+          if (dialogStage === null || vscodeFlow.stage === "idle") return null;
+          return (
+            <VSCodeDialog
+              stage={dialogStage}
+              detail={vscodeFlow.stage === "not-found" || vscodeFlow.stage === "failed" ? vscodeFlow.detail : undefined}
+              via={vscodeFlow.stage === "found" ? vscodeFlow.via : undefined}
+              pendingLabel={`${vscodeFlow.file}:${vscodeFlow.line}`}
+              onDownload={() => openVSCodeDownloadPage()}
+              onCheckAgain={() => void handleVSCodeCheckAgain()}
+              onContinue={() => void handleVSCodeContinue()}
+              onCancel={closeVSCodeFlow}
+            />
+          );
+        })()}
+
         {/* Inspect view stays mounted (display:none) when another nav view
             is active so Monaco's DOM survives the switch. */}
         <div style={{ display: nav === "inspect" ? "contents" : "none" }} aria-hidden={nav !== "inspect"}>
@@ -900,7 +1010,7 @@ export function App() {
                   </button>
                   <button
                     className="db-btn db-btn-cyan"
-                    style={{ ...S.btn, ...S.btnCyan, opacity: canUseSource && !busy ? 1 : 0.5 }}
+                    style={{ ...S.btn, ...S.btnCyan }}
                     onClick={() => void handleLocateFile()}
                     title={canUseSource ? "Find every live instance rendered from this file" : "Available on a connected project"}
                     aria-label="Locate instances in browser"
@@ -910,7 +1020,7 @@ export function App() {
                   </button>
                   <button
                     className="db-btn db-btn-cyan"
-                    style={{ ...S.btn, ...S.btnCyan, opacity: canUseSource && !busy ? 1 : 0.5 }}
+                    style={{ ...S.btn, ...S.btnCyan }}
                     onClick={() => void handleOpenInEditor()}
                     title={canUseSource ? `Open ${identity!.source.file}:${identity!.source.start.line} in VS Code` : "Select an instrumented element on a connected project to open it in VS Code"}
                     aria-label="Open source in VS Code"
@@ -937,12 +1047,12 @@ export function App() {
                     key={v}
                     role="tab"
                     aria-selected={view === v}
-                    className="db-tab"
-                    style={{ ...S.tab, ...(view === v ? S.tabActive : {}) }}
+                    className={`db-tab${view === v ? " db-tab-active" : ""}`}
+                    style={S.tab}
                     onClick={() => setView(v)}
                     disabled={(v === "diff" && !patch) || (v === "applied" && !checkpoint)}
                   >
-                    {v === "editor" ? "Edit" : v === "diff" ? "Diff" : "Applied"}
+                    <span className="db-tab-label">{v === "editor" ? "Edit" : v === "diff" ? "Diff" : "Applied"}</span>
                   </button>
                 ))}
               </div>
@@ -973,7 +1083,7 @@ export function App() {
                     <div style={{ flex: 1 }} />
                     <button
                       className="db-btn db-btn-primary"
-                      style={{ ...S.btn, ...S.btnPrimary, opacity: busy ? 0.6 : 1 }}
+                      style={{ ...S.btn, ...S.btnPrimary }}
                       onClick={() => void handleCreatePatch()}
                       disabled={busy || !source}
                     >
@@ -994,7 +1104,7 @@ export function App() {
 
                   {/* Raw unified diff (collapsible) */}
                   <details style={S.rawDiffDetails}>
-                    <summary className="db-summary" style={{ cursor: "pointer", color: C.muted, fontSize: 11, padding: "6px 12px" }}>
+                    <summary className="db-summary" style={{ cursor: "pointer", fontSize: 11, padding: "6px 12px" }}>
                       Raw unified diff
                     </summary>
                     <pre style={S.rawDiff}>{patch.diff}</pre>
@@ -1002,12 +1112,12 @@ export function App() {
 
                   {/* Action bar */}
                   <div style={S.actionBar}>
-                    <button className="db-btn" style={{ ...S.btn, ...S.btnDanger, opacity: busy ? 0.6 : 1 }} onClick={() => void handleReject()} disabled={busy}>
+                    <button className="db-btn" style={{ ...S.btn, ...S.btnDanger }} onClick={() => void handleReject()} disabled={busy}>
                       Reject
                     </button>
                     <button
                       className="db-btn db-btn-primary"
-                      style={{ ...S.btn, ...S.btnPrimary, opacity: busy ? 0.6 : 1 }}
+                      style={{ ...S.btn, ...S.btnPrimary }}
                       onClick={() => void handleApprove()}
                       disabled={busy}
                     >
@@ -1033,7 +1143,7 @@ export function App() {
                       <div style={{ color: C.muted, fontSize: 11, marginTop: 4 }}>{new Date(checkpoint.timestamp).toLocaleTimeString()}</div>
                       <button
                         className="db-btn"
-                        style={{ ...S.btn, marginTop: 10, opacity: busy ? 0.6 : 1 }}
+                        style={{ ...S.btn, marginTop: 10 }}
                         onClick={() => void handleRollback()}
                         disabled={busy}
                       >
@@ -1157,6 +1267,7 @@ export function App() {
             prefs={prefs}
             onPrefsChange={updatePrefs}
             onRefresh={refreshConnection}
+            refreshToken={refreshTick}
           />
         )}
       </div>

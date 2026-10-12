@@ -24,6 +24,27 @@ export const VIEWS: Record<PanelView, { label: string; hint: string }> = {
 
 export type ConnectionKind = "no-agent" | "unknown-page" | "uninstrumented" | "mismatch" | "connected";
 
+/**
+ * Canonical loopback origin for dev-server matching.
+ *
+ * The build plugin always reports `http://127.0.0.1:<port>`, but developers
+ * open either `localhost` or `127.0.0.1` — same server, different string.
+ * Comparing raw origins would report a spurious mismatch, so both sides are
+ * normalized to the 127.0.0.1 form (ports preserved, unparseable input
+ * returned unchanged for the caller to handle).
+ */
+export function normalizeLoopbackOrigin(origin: string): string {
+  try {
+    const url = new URL(origin);
+    if (url.hostname.toLowerCase() === "localhost") {
+      url.hostname = "127.0.0.1";
+    }
+    return url.origin;
+  } catch {
+    return origin;
+  }
+}
+
 export interface CapabilityContext {
   connection: ConnectionKind;
   hasSelection: boolean;

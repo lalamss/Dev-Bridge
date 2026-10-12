@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { capabilityState, VIEW_ORDER, VIEWS, type CapabilityContext } from "./navigation";
+import { capabilityState, normalizeLoopbackOrigin, VIEW_ORDER, VIEWS, type CapabilityContext } from "./navigation";
 
 /**
  * Navigation + capability-matrix coverage for the redesigned panel.
@@ -72,5 +72,23 @@ describe("capabilityState", () => {
   it("reports busy instead of allowing a duplicate editor open", () => {
     const r = reasons({ busy: true });
     expect(r["open-editor"]).toMatch(/working/i);
+  });
+});
+
+describe("normalizeLoopbackOrigin", () => {
+  it("treats localhost and 127.0.0.1 as the same dev server", () => {
+    expect(normalizeLoopbackOrigin("http://localhost:5173")).toBe("http://127.0.0.1:5173");
+    expect(normalizeLoopbackOrigin("http://127.0.0.1:5173")).toBe("http://127.0.0.1:5173");
+  });
+
+  it("preserves ports and leaves non-loopback origins untouched", () => {
+    expect(normalizeLoopbackOrigin("http://localhost:3000")).toBe("http://127.0.0.1:3000");
+    expect(normalizeLoopbackOrigin("http://192.168.1.10:5173")).toBe("http://192.168.1.10:5173");
+    expect(normalizeLoopbackOrigin("https://example.com")).toBe("https://example.com");
+  });
+
+  it("passes unparseable input through for the caller to handle", () => {
+    expect(normalizeLoopbackOrigin("not-a-url")).toBe("not-a-url");
+    expect(normalizeLoopbackOrigin("")).toBe("");
   });
 });

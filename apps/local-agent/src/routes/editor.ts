@@ -1,8 +1,18 @@
-import { spawn } from "node:child_process";
+import { statSync } from "node:fs";
 import { Router } from "express";
-import { OpenSourceRequestSchema } from "@devbridge/protocol";
+import { OpenSourceRequestSchema, type VSCodeStatus } from "@devbridge/protocol";
 import type { ProjectManager } from "../ProjectManager";
 import { PathEscapeError } from "../SecurityManager";
+import {
+  EditorUnavailableError,
+  openFileInVSCode,
+  refreshVSCodeDiscovery,
+  resolveVSCodeExecutable,
+  VSCodeNotInstalledError,
+  type VSCodeInstall,
+} from "../vscode";
+
+export { EditorUnavailableError };
 
 /**
  * Editor routes — the local-machine side of browser -> source (and the
@@ -15,60 +25,54 @@ import { PathEscapeError } from "../SecurityManager";
  *     the agent's own project id, so a request meant for Project A is never
  *     honored by Project B's agent (409).
  *   - `file` goes through the same `assertPathInProject` containment every
- *     other filesystem route uses — traversal and symlink escapes are 403.
- *   - No caller-controlled commands: argv is always exactly
- *     `code -g <abs>:<line>:<col>` with `shell: false`. There is no generic
- *     command-execution API here.
- *   - When the `code` CLI is missing, the route answers 503 with an
- *     actionable message instead of failing obscurely.
+ *     other filesystem route uses — traversal and symlink escapes are 403 —
+ *     and must exist as a regular file (404 otherwise, so VS Code never
+ *     opens a phantom untitled tab for a moved/deleted path).
+ *   - No caller-controlled commands: the launcher is resolved by DevBridge's
+ *     own VS Code discovery and argv is always exactly
+ *     `<exe> --goto <abs>:<line>:<col>` with no shell string. There is no
+ *     generic command-execution API here.
+ *   - When no usable VS Code is found, the route answers 503 with a
+ *     diagnostic message (install vs. launch failures stay distinct).
  */
 
 /** Opens `<abs>:<line>:<col>` in VS Code. Injected in tests. */
 export type EditorOpener = (absPath: string, line: number, column: number) => Promise<void>;
 
-const CODE_TIMEOUT_MS = 15000;
-
 export function defaultEditorOpener(absPath: string, line: number, column: number): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const target = `${absPath}:${line}:${column}`;
-    let child;
-    try {
-      child = spawn("code", ["-g", target], { shell: false, timeout: CODE_TIMEOUT_MS });
-    } catch (err) {
-      reject(err);
-      return;
-    }
-    let stderr = "";
-    child.stderr?.on("data", (d) => {
-      stderr += String(d);
-    });
-    child.on("error", (err: NodeJS.ErrnoException) => {
-      if (err.code === "ENOENT") {
-        reject(
-          new EditorUnavailableError(
-            "VS Code CLI (`code`) not found on PATH. Install it via VS Code's “Shell Command: Install 'code' command in PATH”, then retry.",
-          ),
-        );
-        return;
-      }
-      reject(err);
-    });
-    child.on("close", (code) => {
-      if (code === 0) resolve();
-      else reject(new Error(`VS Code exited with code ${code}${stderr.trim() ? `: ${stderr.trim().slice(0, 200)}` : ""}`));
-    });
-  });
+  return openFileInVSCode(absPath, line, column).then(() => undefined);
 }
 
-export class EditorUnavailableError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "EditorUnavailableError";
-  }
-}
-
-export function editorRoutes(project: ProjectManager, opener: EditorOpener = defaultEditorOpener): Router {
+export function editorRoutes(
+  project: ProjectManager,
+  opener: EditorOpener = defaultEditorOpener,
+  detect: () => Promise<VSCodeInstall> = resolveVSCodeExecutable,
+): Router {
   const router = Router();
+
+  // GET /editor/vscode[?refresh=1] — installation detection status for the
+  // panel's install dialog. `refresh=1` clears cached discovery first, so a
+  // VS Code installed after the agent started is found even though the
+  // agent's own PATH never changed. Never exposes executable paths.
+  router.get("/editor/vscode", async (req, res) => {
+    if (req.query.refresh === "1") refreshVSCodeDiscovery();
+    try {
+      const install = await detect();
+      const body: VSCodeStatus = { ok: true, found: true, via: install.via };
+      return res.json(body);
+    } catch (err) {
+      if (err instanceof EditorUnavailableError) {
+        const body: VSCodeStatus = { ok: false, found: false, error: err.message };
+        return res.status(503).json(body);
+      }
+      const body: VSCodeStatus = {
+        ok: false,
+        found: false,
+        error: err instanceof Error ? err.message : "VS Code detection failed.",
+      };
+      return res.status(500).json(body);
+    }
+  });
 
   // POST /editor/open { projectId, file, line, column } — open a project
   // file in VS Code at the requested position.
@@ -92,10 +96,30 @@ export function editorRoutes(project: ProjectManager, opener: EditorOpener = def
       return res.status(400).json({ error: "invalid file" });
     }
 
+    let isFile = false;
+    try {
+      isFile = statSync(absPath).isFile();
+    } catch {
+      isFile = false;
+    }
+    if (!isFile) {
+      return res.status(404).json({
+        error: `File not found in the project: "${file}". It may have been moved, renamed, or deleted.`,
+      });
+    }
+
     try {
       await opener(absPath, line, column);
     } catch (err) {
-      if (err instanceof EditorUnavailableError) return res.status(503).json({ error: err.message });
+      // Discovery vs launch stay distinct on the wire: only "not installed"
+      // is 503/not-installed (install dialog); a present-but-unlaunchable
+      // VS Code is 503/launch-failed (retry dialog) or 500, never "not found".
+      if (err instanceof VSCodeNotInstalledError) {
+        return res.status(503).json({ error: err.message, code: "not-installed" });
+      }
+      if (err instanceof EditorUnavailableError) {
+        return res.status(503).json({ error: err.message, code: "launch-failed" });
+      }
       return res.status(500).json({ error: err instanceof Error ? err.message : "editor open failed" });
     }
     res.json({ ok: true, file, line, column });

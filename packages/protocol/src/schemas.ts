@@ -60,6 +60,21 @@ export const OpenSourceRequestSchema = z.object({
   column: z.number().int().nonnegative().max(MAX_SOURCE_LINE),
 });
 
+/**
+ * Editor detection status (`GET /editor/vscode`). The panel's install dialog
+ * ("Check again" / continue flows) is driven by this contract: `found` tells
+ * whether a usable launcher resolved, `via` how (never a raw executable
+ * path), and `error` carries the actionable reason when nothing resolved.
+ */
+export const VSCodeInstallViaSchema = z.enum(["config", "PATH", "install-location", "windows-resolution"]);
+export const VSCodeStatusSchema = z.object({
+  ok: z.boolean(),
+  found: z.boolean(),
+  via: VSCodeInstallViaSchema.optional(),
+  error: z.string().max(2048).optional(),
+});
+export type VSCodeStatus = z.infer<typeof VSCodeStatusSchema>;
+
 export const DevServerReportSchema = z.object({
   /** The dev-server origin serving the instrumented app, e.g. "http://127.0.0.1:5173". */
   url: z.string().min(1).max(256),

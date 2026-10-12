@@ -21,15 +21,15 @@ export function NavRail({ active, onNavigate }: NavRailProps) {
         return (
           <button
             key={id}
-            className="db-rail-btn"
-            style={{ ...S.railBtn, ...(selected ? S.railBtnActive : {}) }}
+            className={`db-rail-btn${selected ? " db-rail-btn-active" : ""}`}
+            style={S.railBtn}
             onClick={() => onNavigate(id)}
             aria-current={selected ? "page" : undefined}
             aria-label={VIEWS[id].label}
             title={`${VIEWS[id].label} — ${VIEWS[id].hint}`}
           >
             {NavIcons[id]}
-            <span>{VIEWS[id].label}</span>
+            <span className="db-rail-label">{VIEWS[id].label}</span>
           </button>
         );
       })}

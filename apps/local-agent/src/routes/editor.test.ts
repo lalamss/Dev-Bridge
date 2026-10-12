@@ -4,8 +4,10 @@ import type { Server } from "node:http";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { VSCodeStatusSchema } from "@devbridge/protocol";
 import { ProjectManager } from "../ProjectManager";
 import { editorRoutes, EditorUnavailableError } from "./editor";
+import { VSCodeNotInstalledError } from "../vscode";
 
 /**
  * Route-level coverage for POST /editor/open (browser -> source -> VS Code).
@@ -119,6 +121,16 @@ describe("POST /editor/open", () => {
     expect(editorCalls()).toEqual([]);
   });
 
+  it("404 + opener untouched for a project file that no longer exists", async () => {
+    const res = await api("/editor/open", {
+      method: "POST",
+      body: openBody({ file: "src/pages/Missing.tsx" }),
+    });
+    expect(res.status).toBe(404);
+    expect(String((res.body as any)?.error ?? "")).toMatch(/not found/i);
+    expect(editorCalls()).toEqual([]);
+  });
+
   it("400 for malformed line/column (schema bounds)", async () => {
     for (const bad of [{ line: 0 }, { line: -3 }, { column: -1 }, { line: 1.5 }, { file: "" }]) {
       const res = await api("/editor/open", { method: "POST", body: openBody(bad) });
@@ -151,6 +163,126 @@ describe("POST /editor/open", () => {
       expect(((await res.json()) as any).error).toMatch(/VS Code CLI/);
     } finally {
       await new Promise<void>((resolve, reject) => s2.close((e) => (e ? reject(e) : resolve())));
+    }
+  });
+
+  it("503/not-installed when discovery finds nothing; launch problems stay distinct", async () => {
+    const { editorRoutes: routes } = await import("./editor");
+    const { VSCodeNotInstalledError } = await import("../vscode");
+    async function postWith(opener: (abs: string, line: number, column: number) => Promise<void>) {
+      const project = new ProjectManager(root);
+      const appN = express();
+      appN.use(express.json());
+      appN.use(routes(project, opener));
+      const sN = await new Promise<Server>((resolve) => {
+        const s = appN.listen(0, "127.0.0.1", () => resolve(s));
+      });
+      const addr = sN.address();
+      const port = typeof addr === "object" && addr ? addr.port : 0;
+      try {
+        const res = await fetch(`http://127.0.0.1:${port}/editor/open`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: openBody(),
+        });
+        return { status: res.status, body: (await res.json()) as any };
+      } finally {
+        await new Promise<void>((resolve, reject) => sN.close((e) => (e ? reject(e) : resolve())));
+      }
+    }
+    // Nothing installed: discovery failure with the install-dialog code.
+    const missing = await postWith(async () => {
+      throw new VSCodeNotInstalledError("VS Code was not detected on this machine.");
+    });
+    expect(missing.status).toBe(503);
+    expect(missing.body.code).toBe("not-installed");
+    // Installed but unstartable: launch failure code, never "not installed".
+    const unstartable = await postWith(async () => {
+      throw new EditorUnavailableError('VS Code launcher "C:\\VS Code\\Code.exe" could not be started.');
+    });
+    expect(unstartable.status).toBe(503);
+    expect(unstartable.body.code).toBe("launch-failed");
+    // A launcher that ran and failed: generic 500, not a 503 at all.
+    const crashed = await postWith(async () => {
+      throw new Error('VS Code CLI "code.cmd" exited (code 1)');
+    });
+    expect(crashed.status).toBe(500);
+    expect(String(crashed.body.error)).toMatch(/exited/);
+  });
+});
+
+describe("GET /editor/vscode", () => {
+  async function statusApp(detect: () => Promise<{ executable: string; via: "config" | "PATH" | "install-location" | "windows-resolution" }>) {
+    const project = new ProjectManager(root);
+    const stubOpener = async () => {};
+    const app3 = express();
+    app3.use(express.json());
+    app3.use(editorRoutes(project, stubOpener, detect));
+    const s3 = await new Promise<Server>((resolve) => {
+      const s = app3.listen(0, "127.0.0.1", () => resolve(s));
+    });
+    const addr = s3.address();
+    const port = typeof addr === "object" && addr ? addr.port : 0;
+    return { s3, port };
+  }
+
+  async function close(s3: Server) {
+    await new Promise<void>((resolve, reject) => s3.close((e) => (e ? reject(e) : resolve())));
+  }
+
+  it("200 + typed found body when an installation resolves", async () => {
+    const { s3, port } = await statusApp(async () => ({
+      executable: "C:\\Program Files\\Microsoft VS Code\\Code.exe",
+      via: "install-location",
+    }));
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/editor/vscode`);
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as unknown;
+      const parsed = VSCodeStatusSchema.safeParse(body);
+      expect(parsed.success).toBe(true);
+      expect(body).toMatchObject({ ok: true, found: true, via: "install-location" });
+    } finally {
+      await close(s3);
+    }
+  });
+
+  it("503 + typed reason when nothing resolves, and refresh re-checks", async () => {
+    let calls = 0;
+    const { s3, port } = await statusApp(async () => {
+      calls += 1;
+      throw new VSCodeNotInstalledError("VS Code was not detected on this machine.");
+    });
+    try {
+      const first = await fetch(`http://127.0.0.1:${port}/editor/vscode`);
+      expect(first.status).toBe(503);
+      const body = (await first.json()) as unknown;
+      expect(VSCodeStatusSchema.safeParse(body).success).toBe(true);
+      expect(body).toMatchObject({ ok: false, found: false });
+      expect(String((body as any).error)).toMatch(/not detected/);
+      // ?refresh=1 forces a fresh detection pass instead of a cached answer.
+      const second = await fetch(`http://127.0.0.1:${port}/editor/vscode?refresh=1`);
+      expect(second.status).toBe(503);
+      expect(calls).toBe(2);
+    } finally {
+      await close(s3);
+    }
+  });
+
+  it("discovers a fresh install on retry after failure", async () => {
+    let installed = false;
+    const { s3, port } = await statusApp(async () => {
+      if (!installed) throw new VSCodeNotInstalledError("VS Code was not detected on this machine.");
+      return { executable: "C:\\VS Code\\Code.exe", via: "install-location" as const };
+    });
+    try {
+      expect((await fetch(`http://127.0.0.1:${port}/editor/vscode`)).status).toBe(503);
+      installed = true; // user installs VS Code, then Check again
+      const retry = await fetch(`http://127.0.0.1:${port}/editor/vscode?refresh=1`);
+      expect(retry.status).toBe(200);
+      expect(await retry.json()).toMatchObject({ ok: true, found: true });
+    } finally {
+      await close(s3);
     }
   });
 });

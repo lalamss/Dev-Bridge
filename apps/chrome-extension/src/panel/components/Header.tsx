@@ -60,10 +60,10 @@ export function Header({ connection, agentProject, agentReachable, pageInfo, onR
       </div>
       <div style={S.headerBtns}>
         <button className="db-btn" style={S.btn} onClick={onRefresh} title="Re-check the local agent and page connection" aria-label="Refresh connection">
-          Refresh
+          <span className="db-btn-label">Refresh</span>
         </button>
         <button className="db-btn" style={S.btn} onClick={onOpenSettings} title="Open Settings" aria-label="Open Settings">
-          Settings
+          <span className="db-btn-label">Settings</span>
         </button>
       </div>
     </div>

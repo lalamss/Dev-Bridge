@@ -10,6 +10,10 @@
 export const WELCOME_WORDMARK_DEV = "Dev";
 export const WELCOME_WORDMARK_BRIDGE = "Bridge";
 export const WELCOME_TAGLINE = "Browser to Source, Seamlessly";
+export const WELCOME_HEADLINE = "Your browser. Your code. Connected.";
+export const WELCOME_DESCRIPTION =
+  "Select any element to jump to its source and inspect live component instances.";
+export const WELCOME_HELPER_CAPTION = "Select an element to get started.";
 export const WELCOME_CTA_LABEL = "Inspect a page";
 export const WELCOME_STOP_LABEL = "Stop inspecting";
 

@@ -3,6 +3,7 @@ import {
   DevServerReportSchema,
   MAX_SOURCE_LINE,
   OpenSourceRequestSchema,
+  VSCodeStatusSchema,
 } from "./schemas";
 
 /**
@@ -44,5 +45,25 @@ describe("DevServerReportSchema", () => {
   it("rejects empty and missing urls", () => {
     expect(DevServerReportSchema.safeParse({ url: "" }).success).toBe(false);
     expect(DevServerReportSchema.safeParse({}).success).toBe(false);
+  });
+});
+
+describe("VSCodeStatusSchema", () => {
+  it("accepts a found installation with its discovery channel", () => {
+    for (const via of ["config", "PATH", "install-location", "windows-resolution"] as const) {
+      expect(VSCodeStatusSchema.safeParse({ ok: true, found: true, via }).success).toBe(true);
+    }
+  });
+
+  it("accepts a missing installation with an actionable reason", () => {
+    expect(
+      VSCodeStatusSchema.safeParse({ ok: false, found: false, error: "VS Code was not detected." }).success,
+    ).toBe(true);
+  });
+
+  it("rejects unknown discovery channels and wrong shapes", () => {
+    expect(VSCodeStatusSchema.safeParse({ ok: true, found: true, via: "registry-hack" }).success).toBe(false);
+    expect(VSCodeStatusSchema.safeParse({ ok: true }).success).toBe(false);
+    expect(VSCodeStatusSchema.safeParse({ ok: false, found: "no" }).success).toBe(false);
   });
 });

@@ -107,7 +107,7 @@ export function ComponentsView({
         )}
         {!error && identities !== null && identities.length === 0 && (
           <div style={{ padding: "8px 12px", color: C.muted, fontSize: 12 }}>
-            No component identities registered. Reload the page on the dev server so the build plugin re-sends them.
+            No component identities registered. Edit and save a source file so the build plugin re-sends them.
           </div>
         )}
         {!error && identities !== null && visible.length === 0 && identities.length > 0 && (
@@ -122,8 +122,8 @@ export function ComponentsView({
             <div key={i.id} style={{ display: "flex", alignItems: "center", gap: 4, paddingRight: 8 }}>
               <button
                 role="listitem"
-                className="db-row"
-                style={{ ...S.row, ...(selected ? S.rowActive : {}), flex: "1 1 auto", minWidth: 0 }}
+                className={`db-row${selected ? " db-row-active" : ""}`}
+                style={{ ...S.row, flex: "1 1 auto", minWidth: 0 }}
                 onClick={() => onSelect(i.id)}
                 title={`Select ${i.component ?? i.id} in the Inspect workspace`}
                 aria-label={`Select ${i.component ?? i.id}`}

@@ -20,6 +20,8 @@ interface SettingsViewProps {
   prefs: PanelPreferences;
   onPrefsChange: (prefs: PanelPreferences) => void;
   onRefresh: () => void;
+  /** Bumped by Refresh status so counts refetch instead of going stale. */
+  refreshToken?: number;
 }
 
 function StatusLine({ label, value, tone }: { label: string; value: string; tone?: "ok" | "warn" | "bad" }) {
@@ -43,6 +45,7 @@ export function SettingsView({
   prefs,
   onPrefsChange,
   onRefresh,
+  refreshToken = 0,
 }: SettingsViewProps) {
   const [identityCount, setIdentityCount] = useState<number | null>(null);
 
@@ -63,10 +66,19 @@ export function SettingsView({
     return () => {
       cancelled = true;
     };
-  }, [agentReachable]);
+    // refreshToken refetches on manual Refresh; without it this view would
+    // keep showing mount-time counts after the registry heals underneath.
+  }, [agentReachable, refreshToken]);
 
+  // "connected" with no registered dev-server URL means the origin check was
+  // bypassed (nothing to compare against) — report it as unverified rather
+  // than claiming a match. DOM identity counts likewise never prove that
+  // source mappings were registered; only the agent registry count does.
+  const originVerified = connection.kind === "connected" && !!agentProject?.devServerUrl;
   const connectionText =
-    connection.kind === "connected" ? `Connected — page origin matches the project dev server.`
+    connection.kind === "connected" && !agentProject?.devServerUrl
+    ? `Connected, but the dev server URL is not registered — origin match not verified. Start the app with the DevBridge Vite plugin, then Refresh status.`
+    : connection.kind === "connected" ? `Connected — page origin matches the project dev server.`
     : connection.kind === "no-agent" ? "Local agent unreachable — run `devbridge start` in the project."
     : connection.kind === "unknown-page" ? "Waiting for page info — open the inspected tab on the dev server."
     : connection.kind === "uninstrumented" ? "This page reports no build-plugin identities."
@@ -90,7 +102,7 @@ export function SettingsView({
       <StatusLine
         label="Connection"
         value={connectionText}
-        tone={connection.kind === "connected" ? "ok" : connection.kind === "mismatch" ? "warn" : "bad"}
+        tone={connection.kind === "connected" ? (originVerified ? "ok" : "warn") : connection.kind === "mismatch" ? "warn" : "bad"}
       />
       <StatusLine
         label="Project"
@@ -110,7 +122,7 @@ export function SettingsView({
           identityCount === null
             ? "Unknown — agent unreachable."
             : identityCount === 0
-              ? "No identities registered — reload the page so the build plugin re-sends them."
+              ? "No identities registered — edit and save a source file (or restart the dev server) so the build plugin re-sends them, then Refresh status."
               : `${identityCount} component identities registered.`
         }
         tone={identityCount === null || identityCount === 0 ? "warn" : "ok"}

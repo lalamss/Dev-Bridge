@@ -72,9 +72,13 @@ export const S: Record<string, CSSProperties> = {
   headerBtns: { display: "flex", alignItems: "center", gap: 6, flexShrink: 0 },
 
   // ── Nav rail ──
+  // NOTE: rail-button colors, backgrounds, and the active indicator live in
+  // panel.html (.db-rail-btn / .db-rail-btn-active). Inline styles always beat
+  // stylesheet :hover rules, so these tokens carry layout only — putting
+  // background/color here is what silently killed the hover states.
   rail: { display: "flex", flexDirection: "column", width: 60, flexShrink: 0, background: C.rail, borderRight: `1px solid ${C.border}`, padding: "8px 0", gap: 2, alignItems: "stretch" },
-  railBtn: { display: "flex", flexDirection: "column", alignItems: "center", gap: 3, padding: "8px 2px", margin: "0 4px", border: "none", borderLeft: "2px solid transparent", borderRadius: 6, background: "transparent", color: C.muted, cursor: "pointer", fontSize: 10, fontFamily: UI_FONT },
-  railBtnActive: { color: C.text, background: C.card, borderLeftColor: C.accent },
+  railBtn: { display: "flex", flexDirection: "column", alignItems: "center", gap: 3, padding: "8px 2px", margin: "0 4px", borderRadius: 6, cursor: "pointer", fontSize: 10, fontFamily: UI_FONT },
+  railBtnActive: {} as CSSProperties,
 
   // ── Thin connection strip ──
   connStrip: { display: "flex", alignItems: "center", gap: 8, padding: "4px 12px", minHeight: 26, fontSize: 11, flexShrink: 0, borderBottom: `1px solid ${C.borderSoft}`, background: C.bg, color: C.muted, overflow: "hidden", whiteSpace: "nowrap" as const, textOverflow: "ellipsis" },
@@ -88,8 +92,10 @@ export const S: Record<string, CSSProperties> = {
   actionsRow: { display: "flex", alignItems: "center", gap: 6, flexShrink: 0, flexWrap: "wrap" as const },
 
   tabStrip: { display: "flex", gap: 2, borderBottom: `1px solid ${C.borderSoft}`, background: C.bg, flexShrink: 0, padding: "0 8px" },
-  tab: { padding: "7px 12px", border: "none", borderBottom: "2px solid transparent", background: "transparent", color: C.muted, cursor: "pointer", fontSize: 12, fontFamily: UI_FONT },
-  tabActive: { color: C.text, borderBottomColor: C.accent },
+  // NOTE: tab colors/underline live in panel.html (.db-tab / .db-tab-active)
+  // for the same inline-beats-:hover reason as the rail buttons above.
+  tab: { padding: "7px 12px", cursor: "pointer", fontSize: 12, fontFamily: UI_FONT },
+  tabActive: {} as CSSProperties,
 
   editorWrapper: { display: "flex", flexDirection: "column", flex: "1 1 auto", minHeight: 200, overflow: "hidden" },
   monacoContainer: { flex: 1, minHeight: 0 },
@@ -98,7 +104,8 @@ export const S: Record<string, CSSProperties> = {
 
   lowerSections: { flexShrink: 0, borderTop: `1px solid ${C.borderSoft}`, background: C.bg, maxHeight: "38%", overflowY: "auto" as const },
   disclosure: { borderBottom: `1px solid ${C.borderSoft}` },
-  disclosureSummary: { cursor: "pointer", color: C.muted, fontSize: 11, fontWeight: 600, letterSpacing: "0.04em", textTransform: "uppercase" as const, padding: "7px 12px", listStyle: "none" },
+  // NOTE: summary color lives in panel.html (.db-summary) so :hover applies.
+  disclosureSummary: { cursor: "pointer", fontSize: 11, fontWeight: 600, letterSpacing: "0.04em", textTransform: "uppercase" as const, padding: "7px 12px", listStyle: "none" },
   disclosureBody: { padding: "0 12px 10px 12px" },
 
   diffWrapper: { display: "flex", flexDirection: "column", flex: "1 1 auto", minHeight: 200, overflow: "hidden" },
@@ -127,6 +134,9 @@ export const S: Record<string, CSSProperties> = {
     textAlign: "center" as const,
     padding: "32px 20px",
     background: WELCOME_BACKGROUND,
+    // Positioning context for the decorative point-cloud canvas, which
+    // renders absolutely behind the content (see .db-point-cloud).
+    position: "relative" as const,
   },
   welcomeGroup: {
     display: "flex",
@@ -136,6 +146,9 @@ export const S: Record<string, CSSProperties> = {
     width: "min(440px, 100%)",
     maxWidth: 440,
     margin: "0 auto",
+    // Sits above the point-cloud canvas so text stays crisp and clickable.
+    position: "relative" as const,
+    zIndex: 1,
   },
   welcomeLogoWrap: { display: "flex", justifyContent: "center", width: "100%" },
   welcomeWordmark: {
@@ -164,15 +177,40 @@ export const S: Record<string, CSSProperties> = {
     marginTop: 8,
     maxWidth: 400,
   },
+  welcomeHeadline: {
+    fontFamily: WELCOME_FONT,
+    fontSize: "clamp(17px, 3.4vw, 22px)",
+    fontWeight: 700,
+    lineHeight: 1.3,
+    color: "#f3f4f6",
+    marginTop: 18,
+    maxWidth: 400,
+  },
+  welcomeDescription: {
+    fontFamily: WELCOME_FONT,
+    fontSize: 13,
+    lineHeight: 1.55,
+    color: "#9aa0ae",
+    marginTop: 8,
+    maxWidth: 400,
+  },
+  welcomeCaption: {
+    fontFamily: WELCOME_FONT,
+    fontSize: 12,
+    lineHeight: 1.5,
+    color: C.dim,
+    marginTop: 10,
+    maxWidth: 400,
+  },
   welcomeCta: {
-    marginTop: 26,
+    marginTop: 24,
     padding: "8px 28px",
     borderRadius: 6,
     fontWeight: 600,
     fontFamily: WELCOME_FONT,
   },
-  welcomeHint: { fontFamily: WELCOME_FONT, fontSize: 12, color: C.muted, marginTop: 12, maxWidth: 400, lineHeight: 1.5 },
-  welcomeLiveHint: { fontFamily: WELCOME_FONT, fontSize: 12, color: "#9aa0ae", marginTop: 12, maxWidth: 400, lineHeight: 1.5 },
+  welcomeHint: { fontFamily: WELCOME_FONT, fontSize: 12, color: C.muted, marginTop: 10, maxWidth: 400, lineHeight: 1.5 },
+  welcomeLiveHint: { fontFamily: WELCOME_FONT, fontSize: 12, color: "#9aa0ae", marginTop: 10, maxWidth: 400, lineHeight: 1.5 },
   cards: { display: "flex", flexWrap: "wrap" as const, gap: 8, justifyContent: "center", marginTop: 12, maxWidth: 560 },
   card: { width: 160, textAlign: "left" as const, background: C.card, border: `1px solid ${C.border}`, borderRadius: 8, padding: "10px 12px", display: "flex", flexDirection: "column", gap: 4 },
   cardTitle: { fontSize: 12, fontWeight: 600, color: C.text },
@@ -183,8 +221,10 @@ export const S: Record<string, CSSProperties> = {
   searchBar: { display: "flex", gap: 8, padding: "8px 12px", borderBottom: `1px solid ${C.borderSoft}`, flexShrink: 0 },
   searchInput: { flex: 1, minWidth: 0, background: C.bg, border: `1px solid ${C.border}`, borderRadius: 4, color: C.text, fontSize: 12, fontFamily: UI_FONT, padding: "5px 10px" },
   listBody: { flex: "1 1 auto", overflowY: "auto" as const, padding: "4px 0" },
-  row: { display: "flex", alignItems: "center", gap: 8, width: "100%", textAlign: "left" as const, background: "transparent", border: "none", borderLeft: "2px solid transparent", color: C.text, padding: "7px 12px", cursor: "pointer", fontSize: 12, fontFamily: UI_FONT },
-  rowActive: { background: C.card, borderLeftColor: C.accent },
+  // NOTE: row colors/backgrounds live in panel.html (.db-row / .db-row-active)
+  // for the same inline-beats-:hover reason as the rail buttons above.
+  row: { display: "flex", alignItems: "center", gap: 8, width: "100%", textAlign: "left" as const, padding: "7px 12px", cursor: "pointer", fontSize: 12, fontFamily: UI_FONT },
+  rowActive: {} as CSSProperties,
   rowMeta: { fontFamily: MONO_FONT, fontSize: 11, color: C.muted, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
   preview: { borderTop: `1px solid ${C.borderSoft}`, background: C.bg2, padding: "8px 12px", maxHeight: "45%", overflowY: "auto" as const, flexShrink: 0, fontFamily: MONO_FONT, fontSize: 11, color: C.muted, whiteSpace: "pre" as const },
 
@@ -194,9 +234,14 @@ export const S: Record<string, CSSProperties> = {
   settingLabel: { fontWeight: 600, color: C.text, fontSize: 12 },
   settingDesc: { color: C.muted, fontSize: 11 },
 
-  btn: { background: "transparent", color: C.text, border: `1px solid ${C.border}`, borderRadius: 4, padding: "4px 10px", cursor: "pointer", fontSize: 12, fontFamily: UI_FONT, lineHeight: 1.4, whiteSpace: "nowrap" as const },
-  btnPrimary: { background: C.accentDim, borderColor: C.accentDim, color: "#fff" },
-  btnCyan: { background: "transparent", borderColor: C.cyanDim, color: C.cyan },
-  btnDanger: { background: "transparent", color: C.text, border: `1px solid ${C.border}` },
+  // NOTE: button colors, backgrounds, and borders live in panel.html
+  // (.db-btn / .db-btn-primary / .db-btn-cyan). Inline background/border/color
+  // always beat stylesheet :hover rules, so these tokens carry layout and
+  // typography only. Disabled dimming comes from CSS :disabled — do not add
+  // inline opacity to buttons or it will override the disabled state.
+  btn: { borderRadius: 4, padding: "4px 10px", cursor: "pointer", fontSize: 12, fontFamily: UI_FONT, lineHeight: 1.4, whiteSpace: "nowrap" as const },
+  btnPrimary: {} as CSSProperties,
+  btnCyan: {} as CSSProperties,
+  btnDanger: {} as CSSProperties,
   ic: { background: C.card, padding: "1px 5px", borderRadius: 3, color: C.text, fontFamily: MONO_FONT, fontSize: 11 },
 };

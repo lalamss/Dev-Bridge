@@ -20,12 +20,15 @@ export function DevBridgeMark({ size = 22 }: { size?: number }) {
 }
 
 /**
- * Centered welcome mark: a clean geometric "D" with a violet-to-blue
- * gradient on a transparent background. Vector-only so it stays sharp at
- * any DevTools panel size; the wrapper scales it down gracefully via
- * max-width (see InspectLanding).
+ * Centered welcome mark: a clean geometric D/bridge symbol with a
+ * restrained violet-to-blue accent on a transparent background.
+ * Vector-only so it stays sharp at any DevTools panel size; the wrapper
+ * scales it down gracefully via max-width (see InspectLanding).
+ *
+ * The chamfered D ring carries a single bridge-deck beam across its
+ * counter — one accent, no extra decoration.
  */
-export function DevBridgeWelcomeMark({ size = 88 }: { size?: number }) {
+export function DevBridgeWelcomeMark({ size = 80 }: { size?: number }) {
   const gradientId = "db-welcome-d-grad";
   return (
     <svg
@@ -43,12 +46,14 @@ export function DevBridgeWelcomeMark({ size = 88 }: { size?: number }) {
           <stop offset="1" stopColor="#3b82f6" />
         </linearGradient>
       </defs>
-      {/* Geometric D: outer silhouette with an even-odd inner cutout. */}
+      {/* Geometric D ring: chamfered outer silhouette + inner counter. */}
       <path
-        d="M32 12 H52 A36 36 0 0 1 52 84 H32 Z M42 24 V72 H50 A24 24 0 0 0 50 24 H42 Z"
+        d="M30 14 H54 L70 28 V68 L54 82 H30 Z M40 26 H52 L60 33 V63 L52 70 H40 Z"
         fill={`url(#${gradientId})`}
         fillRule="evenodd"
       />
+      {/* Bridge deck: a single beam spanning the counter, same accent. */}
+      <rect x="40" y="44.5" width="21" height="4.5" rx="2.25" fill={`url(#${gradientId})`} />
     </svg>
   );
 }

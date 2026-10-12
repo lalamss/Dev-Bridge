@@ -12,6 +12,12 @@ export class DevIdentityRegistry {
   private byFile = new Map<string, Set<string>>();
 
   upsert(identity: DevIdentity): void {
+    // An HMR re-emit can move an id to a different file: drop it from the
+    // previous file's index so per-file listings never keep stale ghosts.
+    const prev = this.byId.get(identity.id);
+    if (prev && prev.source.file !== identity.source.file) {
+      this.byFile.get(prev.source.file)?.delete(identity.id);
+    }
     this.byId.set(identity.id, identity);
     const set = this.byFile.get(identity.source.file) ?? new Set<string>();
     set.add(identity.id);

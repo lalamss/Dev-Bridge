@@ -7,31 +7,98 @@
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     html, body, #root { height: 100%; background: #16181d; }
-    /* Subtle, consistent interaction states (inline styles can't do :hover). */
+    /* ── DevBridge interaction system ──
+       Interactive colors, backgrounds, and borders live HERE, not in React
+       inline styles: inline declarations outrank stylesheet :hover rules, so
+       any background/border/color set inline silently kills the hover state
+       below. Theme tokens in theme.ts therefore carry layout and typography
+       only. One canonical rule per state; 150–200 ms transitions; no
+       keyframes, no continuous animation, no layout-dimension animation.
+       The welcome logo is static (non-interactive) and has no hover effect
+       so it never reads as a button. */
+    .db-btn { background: transparent; color: #e4e4e7; border: 1px solid #2a2e38; transition: background-color 0.16s ease, border-color 0.16s ease, color 0.16s ease, box-shadow 0.16s ease; }
     .db-btn:hover:not(:disabled) { background: #2a2e38; border-color: #3f3f46; }
+    .db-btn:active:not(:disabled) { background: #23262f; border-color: #3f3f46; }
+    .db-btn:focus-visible { outline: 1px solid #9d8cff; outline-offset: 1px; }
     .db-btn:disabled { cursor: not-allowed; opacity: 0.5; }
-    .db-btn:focus-visible, .db-tab:focus-visible, .db-summary:focus-visible,
-    .db-rail-btn:focus-visible, .db-card:focus-visible, .db-row:focus-visible,
-    .db-search:focus-visible, .db-welcome-cta:focus-visible {
-      outline: 1px solid #9d8cff; outline-offset: 1px;
-    }
-    /* Centered welcome primary action: subtle violet accent, clear states. */
-    .db-welcome-cta { transition: background 0.15s ease, border-color 0.15s ease; }
-    .db-welcome-cta:hover:not(:disabled) { background: #7c6cf0; border-color: #7c6cf0; }
-    .db-welcome-cta:focus-visible { outline: 2px solid #9d8cff; outline-offset: 2px; }
-    .db-welcome-cta:disabled { cursor: not-allowed; opacity: 0.5; }
-    @media (prefers-reduced-motion: reduce) {
-      .db-welcome-cta { transition: none; }
-    }
-    .db-btn-primary:hover:not(:disabled) { background: #7c6cf0; border-color: #7c6cf0; }
+    .db-btn-primary { background: #6d5ef0; border-color: #6d5ef0; color: #fff; }
+    .db-btn-primary:hover:not(:disabled) { background: #7c6cf0; border-color: #7c6cf0; box-shadow: 0 2px 12px rgba(124, 108, 240, 0.35); }
+    .db-btn-primary:active:not(:disabled) { background: #5a4cd4; border-color: #5a4cd4; box-shadow: none; }
+    .db-btn-cyan { background: transparent; border-color: #0e7490; color: #67e8f9; }
     .db-btn-cyan:hover:not(:disabled) { background: rgba(103, 232, 249, 0.08); border-color: #67e8f9; }
-    .db-tab:hover:not(:disabled) { color: #e4e4e7; }
+    .db-btn-cyan:active:not(:disabled) { background: rgba(103, 232, 249, 0.14); border-color: #67e8f9; }
+    /* Centered welcome primary action: brighter violet, subtle shadow, 2px lift. */
+    .db-welcome-cta:focus-visible { outline: 2px solid #9d8cff; outline-offset: 2px; box-shadow: 0 0 0 3px rgba(157, 140, 255, 0.35); }
+    .db-welcome-cta:hover:not(:disabled) { background: #7c6cf0; border-color: #7c6cf0; box-shadow: 0 4px 18px rgba(124, 108, 240, 0.35); transform: translateY(-2px); }
+    .db-welcome-cta:active:not(:disabled) { background: #5a4cd4; border-color: #5a4cd4; box-shadow: 0 1px 6px rgba(124, 108, 240, 0.25); transform: translateY(0); }
+    .db-welcome-cta:disabled { cursor: not-allowed; opacity: 0.5; transform: none; box-shadow: none; }
+    .db-welcome-cta { transition: background-color 0.18s ease, border-color 0.18s ease, box-shadow 0.18s ease, transform 0.18s ease; }
+    /* Sidebar navigation: tint + brighter text on hover; the active item keeps
+       its violet indicator and never borrows the hover tint. */
+    .db-rail-btn { background: transparent; color: #a1a1aa; border: none; border-left: 2px solid transparent; transition: background-color 0.16s ease, color 0.16s ease, border-color 0.16s ease; }
+    .db-rail-btn:not(.db-rail-btn-active):hover { background: #1e2129; color: #e4e4e7; }
+    .db-rail-btn-active { background: #1e2129; color: #e4e4e7; border-left-color: #9d8cff; }
+    .db-rail-btn:focus-visible { outline: 1px solid #9d8cff; outline-offset: 1px; }
+    .db-rail-btn:active { background: #23262f; }
+    /* Source-view tabs and list rows follow the same pattern. */
+    .db-tab { background: transparent; color: #a1a1aa; border: none; border-bottom: 2px solid transparent; transition: color 0.16s ease, border-color 0.16s ease, background-color 0.16s ease; }
+    .db-tab:hover:not(:disabled) { color: #e4e4e7; background: #1e2129; }
+    .db-tab-active { color: #e4e4e7; border-bottom-color: #9d8cff; }
+    .db-tab:active:not(:disabled) { color: #e4e4e7; background: #23262f; }
+    .db-tab:focus-visible { outline: 1px solid #9d8cff; outline-offset: 1px; }
     .db-tab:disabled { cursor: not-allowed; opacity: 0.4; }
-    .db-rail-btn:hover { color: #e4e4e7; background: #1e2129; }
-    .db-card:hover:not(:disabled) { border-color: #3f3f46; }
+    .db-row { background: transparent; color: #e4e4e7; border: none; border-left: 2px solid transparent; transition: background-color 0.16s ease, border-color 0.16s ease; }
     .db-row:hover { background: #1e2129; }
+    .db-row-active { background: #1e2129; border-left-color: #9d8cff; }
+    .db-row:active { background: #23262f; }
+    .db-row:focus-visible { outline: 1px solid #9d8cff; outline-offset: 1px; }
+    .db-summary { color: #a1a1aa; transition: color 0.16s ease; }
     .db-summary:hover { color: #e4e4e7; }
+    .db-summary:focus-visible { outline: 1px solid #9d8cff; outline-offset: 1px; }
     .db-summary::marker { color: #71717a; font-size: 10px; }
+    .db-search { cursor: text; }
+    .db-search:focus-visible { outline: 1px solid #9d8cff; outline-offset: 1px; }
+    /* Decorative welcome point-cloud: strictly behind the content, never
+       interactive (pointer-events none, no cursor, no hover). Kept dim so
+       logo text and the Inspect action stay fully readable. */
+    .db-point-cloud { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; opacity: 0.55; }
+    /* VS Code install dialog: static card over the panel (buttons reuse the
+       global .db-btn states, so no hover/transition rules live here). */
+    .db-dialog-backdrop { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; padding: 16px; background: rgba(4, 6, 12, 0.6); z-index: 50; }
+    .db-dialog-card { width: min(400px, 100%); background: #1e2129; border: 1px solid #2a2e38; border-radius: 8px; padding: 14px 16px; text-align: left; }
+    .db-dialog-title { font-size: 13px; font-weight: 700; color: #e4e4e7; margin-bottom: 6px; }
+    .db-dialog-text { font-size: 12px; color: #a1a1aa; line-height: 1.5; }
+    .db-dialog-detail { font-size: 11px; color: #71717a; line-height: 1.5; margin-top: 6px; word-break: break-word; }
+    .db-dialog-actions { display: flex; gap: 8px; justify-content: flex-end; align-items: center; margin-top: 12px; flex-wrap: wrap; }
+    /* Cursor behavior is owned here (not by inline styles): pointer on every
+       clickable control, text in inputs, not-allowed on disabled controls
+       (declared alongside each :disabled rule above). */
+    .db-rail-btn:not(:disabled), .db-tab:not(:disabled), .db-row, .db-summary, .db-btn:not(:disabled) { cursor: pointer; }
+    /* ── Animated text underline ──
+       A thin violet-blue line sized to the label text (the span), drawn
+       left-to-right with a transform so it never shifts layout. It appears
+       on hover and keyboard focus; the active rail item keeps it persistently
+       alongside its violet edge indicator. Filled primary/cyan action buttons
+       keep their background feedback only — no underline there — and plain
+       headings/descriptions carry no label class so they never underline. */
+    .db-rail-label, .db-tab-label, .db-btn-label { position: relative; display: inline-block; }
+    .db-rail-label::after, .db-tab-label::after, .db-btn-label::after {
+      content: ""; position: absolute; left: 0; right: 0; bottom: -2px; height: 1px;
+      background: linear-gradient(90deg, #a78bfa 0%, #60a5fa 100%);
+      transform: scaleX(0); transform-origin: left center;
+      transition: transform 0.20s ease;
+    }
+    .db-rail-btn:not(.db-rail-btn-active):hover .db-rail-label::after { transform: scaleX(1); }
+    .db-rail-btn:focus-visible .db-rail-label::after { transform: scaleX(1); }
+    .db-rail-btn-active .db-rail-label::after { transform: scaleX(1); }
+    .db-tab:hover:not(:disabled) .db-tab-label::after { transform: scaleX(1); }
+    .db-tab:focus-visible .db-tab-label::after { transform: scaleX(1); }
+    .db-btn:hover:not(:disabled) .db-btn-label::after { transform: scaleX(1); }
+    .db-btn:focus-visible .db-btn-label::after { transform: scaleX(1); }
+    @media (prefers-reduced-motion: reduce) {
+      .db-btn, .db-welcome-cta, .db-rail-btn, .db-tab, .db-row, .db-summary, .db-rail-label::after, .db-tab-label::after, .db-btn-label::after { transition: none; }
+      .db-welcome-cta:hover:not(:disabled) { transform: none; }
+    }
     @media (max-width: 560px) {
       .db-hide-narrow { display: none; }
     }

@@ -148,4 +148,27 @@ describe("POST /identity/bulk", () => {
     expect(res.status).toBe(400);
     expect(await storedIds()).toEqual([]);
   });
+
+  it("re-pushed identities upsert by id: reloads and HMR never duplicate the registry", async () => {
+    const batch = (extra: string) =>
+      JSON.stringify({ identities: [identity(hexId(1), "src/App.tsx"), identity(hexId(2), extra)] });
+    for (const file of ["src/App.tsx", "src/Other.tsx"]) {
+      const res = await api("/identity/bulk", { method: "POST", body: batch(file) });
+      expect(res.status).toBe(204);
+    }
+    const ids = await storedIds();
+    expect(ids).toHaveLength(2);
+    expect(new Set(ids).size).toBe(ids.length);
+    // The moved id left no ghost in its previous file's listing.
+    const appRes = await fetch(`${url}/identities?file=${encodeURIComponent("src/App.tsx")}`);
+    const appIds = ((await appRes.json()) as { id: string }[]).map((i) => i.id);
+    expect(appIds).not.toContain(hexId(2));
+    const otherRes = await fetch(`${url}/identities?file=${encodeURIComponent("src/Other.tsx")}`);
+    const otherIds = ((await otherRes.json()) as { id: string }[]).map((i) => i.id);
+    expect(otherIds).toContain(hexId(2));
+  });
+
+  it("an empty registry reads back empty (missing registration, not an error)", async () => {
+    expect(await storedIds()).toEqual([]);
+  });
 });

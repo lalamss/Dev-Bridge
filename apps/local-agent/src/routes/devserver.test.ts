@@ -101,8 +101,8 @@ describe("POST /project/dev-server", () => {
     for (const bad of [
       "https://example.com",
       "http://example.com:5173",
-      "http://192.168.1.10:5173",
       "https://127.0.0.1:5173",
+      "http://192.168.1.10:5173",
       "not-a-url",
       "",
     ]) {
@@ -112,5 +112,17 @@ describe("POST /project/dev-server", () => {
       });
       expect(res.status).toBe(400);
     }
+  });
+
+  it("re-reporting the same origin is idempotent (plugin reconciliation safe)", async () => {
+    for (let i = 0; i < 3; i += 1) {
+      const res = await api("/project/dev-server", {
+        method: "POST",
+        body: JSON.stringify({ url: "http://127.0.0.1:5173" }),
+      });
+      expect(res.status).toBe(200);
+    }
+    const info = await api("/project");
+    expect((info.body as any).devServerUrl).toBe("http://127.0.0.1:5173");
   });
 });

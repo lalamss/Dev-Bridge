@@ -3,7 +3,7 @@
  *
  * Thin wrappers over the existing local-agent protocol (GET /project,
  * /identity, /identities, /source, /files, /state, /patch*, /git/*,
- * /editor/open). All functions take an explicit `fetchImpl` so they are
+ * /editor/open, /editor/vscode). All functions take an explicit `fetchImpl` so they are
  * unit-testable in Node without a browser; App.tsx passes the global fetch.
  *
  * Nothing here invents data: failures throw Errors with actionable,
@@ -207,6 +207,67 @@ export interface OpenInEditorArgs {
   column: number;
 }
 
+/** Thrown when the agent reports no usable VS Code (HTTP 503). Drives the install dialog — never a raw PATH error. */
+export class VSCodeNotDetectedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "VSCodeNotDetectedError";
+  }
+}
+
+/** Fixed official download; never built from user input. */
+export const VSCODE_DOWNLOAD_URL = "https://code.visualstudio.com/download";
+
+/** Opens the official download page through a trusted extension action. */
+export function openVSCodeDownloadPage(): void {
+  try {
+    const tabs = (globalThis as unknown as { chrome?: { tabs?: { create: (o: unknown) => void } } }).chrome?.tabs;
+    if (tabs && typeof tabs.create === "function") {
+      tabs.create({ url: VSCODE_DOWNLOAD_URL });
+      return;
+    }
+  } catch {
+    /* fall through to window.open */
+  }
+  if (typeof window !== "undefined" && typeof window.open === "function") {
+    window.open(VSCODE_DOWNLOAD_URL, "_blank", "noopener");
+  }
+}
+
+/** Detection status behind `GET /editor/vscode` (mirrors the protocol schema). */
+export interface VSCodeStatus {
+  ok: boolean;
+  found: boolean;
+  via?: "config" | "PATH" | "install-location" | "windows-resolution";
+  error?: string;
+}
+
+export async function getVSCodeStatus(refresh: boolean, fetchImpl: FetchImpl = fetch): Promise<VSCodeStatus> {
+  let res: Response;
+  try {
+    res = await fetchImpl(`${AGENT}/editor/vscode${refresh ? "?refresh=1" : ""}`);
+  } catch (e) {
+    throw networkError(e);
+  }
+  let body: Partial<VSCodeStatus> = {};
+  try {
+    body = (await res.json()) as Partial<VSCodeStatus>;
+  } catch {
+    /* non-JSON — fall through to the generic shape */
+  }
+  if (res.ok && body.found === true) {
+    return { ok: true, found: true, via: body.via };
+  }
+  return {
+    ok: false,
+    found: false,
+    via: body.via,
+    error: typeof body.error === "string" && body.error.length > 0
+      ? body.error
+      : "VS Code was not detected. Install it, then use Check again.",
+  };
+}
+
 export async function openInEditor(args: OpenInEditorArgs, fetchImpl: FetchImpl = fetch): Promise<void> {
   let res: Response;
   try {
@@ -220,14 +281,24 @@ export async function openInEditor(args: OpenInEditorArgs, fetchImpl: FetchImpl 
   }
   if (res.status === 409) throw new Error("This agent serves a different project — run `devbridge start` in the matching project.");
   if (res.status === 403) throw new Error("Refused: this file is outside the authorized project root.");
+  if (res.status === 404) throw new Error("File not found in the project — it may have been moved, renamed, or deleted.");
   if (res.status === 503) {
     let detail = "";
+    let code = "";
     try {
-      detail = ((await res.json()) as { error?: string }).error ?? "";
+      const body = (await res.json()) as { error?: string; code?: string };
+      detail = body.error ?? "";
+      code = body.code ?? "";
     } catch {
       /* fall through */
     }
-    throw new Error(detail || "VS Code CLI (`code`) not found on PATH.");
+    // Only a genuinely missing installation drives the install dialog; a
+    // present-but-unlaunchable VS Code is an ordinary (flash/dialog-failed)
+    // error. Agents predating the `code` field only 503'd for missing CLIs.
+    if (code === "launch-failed") {
+      throw new Error(detail || "VS Code launch failed. If VS Code was moved or uninstalled, reinstall it and retry.");
+    }
+    throw new VSCodeNotDetectedError(detail || "VS Code was not detected. Install it from https://code.visualstudio.com, then retry — no PATH setup is required.");
   }
   if (!res.ok) throw new Error(`Open in VS Code failed (agent said ${res.status}).`);
 }

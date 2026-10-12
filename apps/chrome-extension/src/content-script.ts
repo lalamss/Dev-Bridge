@@ -92,6 +92,36 @@ function boot(): void {
     }
   }
 
+  // Element-picker cursor: a native crosshair only while inspection is
+  // active. Native keyword (not an image cursor) so extension CSP, page CSP,
+  // text selection, and DevTools are unaffected; editable fields keep the
+  // text cursor. Scoped to localhost dev pages by manifest host_permissions,
+  // and fully removed when inspection ends or the page hides.
+  const INSPECT_CURSOR_TAG_ID = "devbridge-inspect-cursor";
+  const INSPECT_CURSOR_CLASS = "devbridge-inspecting";
+  const INSPECT_CURSOR_CSS = [
+    `html.${INSPECT_CURSOR_CLASS}, html.${INSPECT_CURSOR_CLASS} body { cursor: crosshair !important; }`,
+    `html.${INSPECT_CURSOR_CLASS} a, html.${INSPECT_CURSOR_CLASS} button, html.${INSPECT_CURSOR_CLASS} [role="button"], html.${INSPECT_CURSOR_CLASS} summary { cursor: crosshair !important; }`,
+    `html.${INSPECT_CURSOR_CLASS} input, html.${INSPECT_CURSOR_CLASS} textarea, html.${INSPECT_CURSOR_CLASS} select, html.${INSPECT_CURSOR_CLASS} [contenteditable="true"] { cursor: text !important; }`,
+  ].join("\n");
+
+  function setInspectCursor(value: boolean): void {
+    const root = document.documentElement;
+    if (!root) return;
+    if (value) {
+      if (!document.getElementById(INSPECT_CURSOR_TAG_ID)) {
+        const tag = document.createElement("style");
+        tag.id = INSPECT_CURSOR_TAG_ID;
+        tag.textContent = INSPECT_CURSOR_CSS;
+        (document.head ?? root).appendChild(tag);
+      }
+      root.classList.add(INSPECT_CURSOR_CLASS);
+    } else {
+      root.classList.remove(INSPECT_CURSOR_CLASS);
+      document.getElementById(INSPECT_CURSOR_TAG_ID)?.remove();
+    }
+  }
+
   function setInspecting(value: boolean, notify: boolean): void {
     if (inspecting === value) {
       // Still resync the panel: after a worker restart it may have lost the
@@ -101,6 +131,7 @@ function boot(): void {
     }
     inspecting = value;
     ensureOverlay();
+    setInspectCursor(value);
     if (locateTimer) {
       clearTimeout(locateTimer);
       locateTimer = undefined;
@@ -186,7 +217,7 @@ function boot(): void {
   window.addEventListener("resize", onScrollOrResize);
   // Navigation/reload destroys this world; bfcache restore keeps it with a
   // hidden overlay so no stale box survives the trip.
-  window.addEventListener("pagehide", hideOverlay);
+  window.addEventListener("pagehide", () => { setInspectCursor(false); hideOverlay(); });
 
   // ONE listener for every message (audit X3): the previous two independent
   // onMessage registrations ran every message through both switches.
